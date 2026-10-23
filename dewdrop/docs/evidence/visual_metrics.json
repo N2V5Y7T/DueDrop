@@ -1,0 +1,27 @@
+{
+  "ring_clear_hover": {
+    "orange_tint_pixels": 0,
+    "text_color": "pure_black_ink",
+    "smart_filtering": "PASS",
+    "status": "PASS"
+  },
+  "ring_360_cw_ccw_rotation": {
+    "orange_tint_pixels": 0,
+    "cw_arc": "PASS",
+    "ccw_arc": "PASS",
+    "shine_sweep": "PASS",
+    "status": "PASS"
+  },
+  "window_options_and_progress": {
+    "orange_tint_pixels": 0,
+    "real_photo_thumbnail": "PASS",
+    "minimize_expand_close_controls": "PASS",
+    "status": "PASS"
+  },
+  "dynamic_island_pill": {
+    "orange_tint_pixels": 0,
+    "live_batch_photo_thumbnail": "PASS",
+    "clear_capsule_glass": "PASS",
+    "status": "PASS"
+  }
+}

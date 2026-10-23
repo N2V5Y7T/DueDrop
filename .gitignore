@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging / build artifacts
+build/
+dist/
+dist_setup/
+spec_setup/
+build_spec/
+*.spec
+*.egg-info/
+*.egg
+
+# Binaries and archives
+*.exe
+*.zip
+*.msi
+*.cab
+Dewdrop-Setup.exe
+dewdrop.zip
+payload.zip
+
+# Rust target
+target/
+dewdrop/target/
+
+# Temporary and local test files
+Dew Drop/
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Node
+node_modules/
+liquid-glass-studio-main/

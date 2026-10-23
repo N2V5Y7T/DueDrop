@@ -1,0 +1,11 @@
+[package]
+name = "dewdrop-shell"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dewdrop-core = { path = "../dewdrop-core" }
+dewdrop-engine = { path = "../dewdrop-engine" }
+serde.workspace = true
+serde_json.workspace = true
+windows.workspace = true

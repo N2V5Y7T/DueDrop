@@ -1,0 +1,10 @@
+[package]
+name = "dewdrop-worker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dewdrop-core = { path = "../../crates/dewdrop-core" }
+dewdrop-engine = { path = "../../crates/dewdrop-engine" }
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "drag-harness"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dewdrop-core = { path = "../../crates/dewdrop-core" }
+dewdrop-shell = { path = "../../crates/dewdrop-shell" }
+windows.workspace = true
