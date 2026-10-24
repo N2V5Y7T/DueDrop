@@ -838,6 +838,32 @@ def _get_ring_geometry(size: int) -> dict[str, np.ndarray]:
     inner_stroke_rgb = (inner_stroke[..., None] * pure_white * 0.88 + inner_glow[..., None] * ice_col * 0.65).astype(np.float32)
     inner_stroke_alpha = np.clip(inner_stroke * 0.86 + inner_glow * 0.48, 0.0, 1.0).astype(np.float32)
 
+    track_mask = (d_track < 14.0)
+    track_core_m = track_core[track_mask]
+    track_bevel_m = track_bevel[track_mask]
+    track_glow_m = track_glow[track_mask]
+    track_haze_m = track_haze[track_mask]
+    idle_core_m = idle_core[track_mask]
+    ang_m = ang[track_mask].astype(np.float32)
+
+    hub_r = r_inner_ring * 0.90
+    hub_sdf = r - hub_r
+    hub_cov = smooth_step(0.75, -0.75, hub_sdf).astype(np.float32)
+    hub_mask = (hub_cov * 0.26).astype(np.float32)
+    hub_rim = (np.exp(-0.5 * (hub_sdf / 0.80) ** 2) * 0.82).astype(np.float32)
+    hub_roi = (r < (hub_r + 4.0))
+    hub_mask_sub = hub_mask[hub_roi, None]
+    hub_rim_sub = (hub_rim[hub_roi, None] * 0.85).astype(np.float32)
+
+    btn_idx = (mask > 0.001)
+    mask_btn = mask[btn_idx, None].astype(np.float32)
+    gx_btn = gx[btn_idx].astype(np.float32)
+    gy_btn = gy[btn_idx].astype(np.float32)
+    rim_sharp_btn = rim_sharp[btn_idx].astype(np.float32)
+    sweep_btn = sweep[btn_idx, None].astype(np.float32)
+    seg_btn = seg_idx[btn_idx]
+    centre_mask = (r < r_inner_ring)
+
     geom = {
         "x_idx": x_idx.astype(np.float32),
         "y_idx": y_idx.astype(np.float32),
@@ -867,6 +893,27 @@ def _get_ring_geometry(size: int) -> dict[str, np.ndarray]:
         "track_glow": track_glow,
         "track_haze": track_haze,
         "idle_core": idle_core,
+        "track_mask": track_mask,
+        "track_core_m": track_core_m,
+        "track_bevel_m": track_bevel_m,
+        "track_glow_m": track_glow_m,
+        "track_haze_m": track_haze_m,
+        "idle_core_m": idle_core_m,
+        "ang_m": ang_m,
+        "hub_r": hub_r,
+        "hub_mask": hub_mask,
+        "hub_rim": hub_rim,
+        "hub_roi": hub_roi,
+        "hub_mask_sub": hub_mask_sub,
+        "hub_rim_sub": hub_rim_sub,
+        "btn_idx": btn_idx,
+        "mask_btn": mask_btn,
+        "gx_btn": gx_btn,
+        "gy_btn": gy_btn,
+        "rim_sharp_btn": rim_sharp_btn,
+        "sweep_btn": sweep_btn,
+        "seg_btn": seg_btn,
+        "centre_mask": centre_mask,
         "idx_r": idx_r,
         "idx_g": idx_g,
         "idx_b": idx_b,
@@ -915,9 +962,18 @@ def _get_ring_refracted_base(size: int, backdrop_rgb: np.ndarray) -> dict[str, n
     sheen = (g["sweep"] * 0.16 + g["bevel_band"] * 0.12 + g["rim_inner"])[..., None]
     base_tiles = refracted_tiles * (1.0 - sheen * 0.30) + 255.0 * sheen
 
+    pure_white = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+    base_tiles_clip = np.clip(base_tiles, 0.0, 255.0).astype(np.float32)
+    hub_roi = g.get("hub_roi")
+    hub_fill_sub = (backdrop_rgb[hub_roi] * 0.70 + frosted[hub_roi] * 0.30 + pure_white * 0.08).astype(np.float32) if hub_roi is not None else None
+    btn_idx = g.get("btn_idx")
+    base_tiles_btn = base_tiles_clip[btn_idx].copy() if btn_idx is not None else None
+
     res = {
         "frosted": frosted.astype(np.float32),
-        "base_tiles": np.clip(base_tiles, 0.0, 255.0).astype(np.float32),
+        "base_tiles": base_tiles_clip,
+        "base_tiles_btn": base_tiles_btn,
+        "hub_fill_sub": hub_fill_sub,
     }
     if len(_RING_BASE_CACHE) > 8:
         _RING_BASE_CACHE.clear()
@@ -932,6 +988,66 @@ def draw_shadowed_text(draw: ImageDraw.ImageDraw, pos: tuple[float, float], text
     draw.text((x, y), text, font=font, fill=fill)
 
 
+RING_THEMES: list[dict[str, np.ndarray]] = [
+    {
+        "primary_neon": np.array([0.0, 225.0, 255.0], dtype=np.float32),   # Electric Cyan
+        "deep_base": np.array([12.0, 52.0, 118.0], dtype=np.float32),      # Deep Ocean Azure
+        "ice_col": np.array([228.0, 244.0, 255.0], dtype=np.float32),       # Frost Cyan
+        "tint_col": np.array([45.0, 205.0, 255.0], dtype=np.float32),       # Cyan Glow
+    },
+    {
+        "primary_neon": np.array([0.0, 255.0, 175.0], dtype=np.float32),   # Aurora Emerald Mint
+        "deep_base": np.array([10.0, 85.0, 58.0], dtype=np.float32),       # Deep Forest Jade
+        "ice_col": np.array([215.0, 255.0, 235.0], dtype=np.float32),      # Mint Frost
+        "tint_col": np.array([45.0, 245.0, 175.0], dtype=np.float32),      # Mint Glow
+    },
+    {
+        "primary_neon": np.array([195.0, 95.0, 255.0], dtype=np.float32),  # Radiant Amethyst Purple
+        "deep_base": np.array([70.0, 18.0, 120.0], dtype=np.float32),      # Deep Imperial Violet
+        "ice_col": np.array([240.0, 215.0, 255.0], dtype=np.float32),      # Lavender Frost
+        "tint_col": np.array([195.0, 115.0, 255.0], dtype=np.float32),     # Amethyst Glow
+    },
+    {
+        "primary_neon": np.array([255.0, 168.0, 25.0], dtype=np.float32),  # Radiant Sunset Amber
+        "deep_base": np.array([125.0, 50.0, 10.0], dtype=np.float32),      # Deep Bronze Amber
+        "ice_col": np.array([255.0, 235.0, 200.0], dtype=np.float32),      # Amber Sun Frost
+        "tint_col": np.array([255.0, 185.0, 50.0], dtype=np.float32),      # Amber Glow
+    },
+    {
+        "primary_neon": np.array([255.0, 65.0, 155.0], dtype=np.float32),  # Vivid Rose Coral Quartz
+        "deep_base": np.array([115.0, 16.0, 68.0], dtype=np.float32),      # Deep Crimson Velvet
+        "ice_col": np.array([255.0, 215.0, 235.0], dtype=np.float32),      # Rose Frost
+        "tint_col": np.array([255.0, 100.0, 180.0], dtype=np.float32),     # Rose Glow
+    },
+]
+
+
+def get_ring_theme_colors(turns: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Interpolates smoothly between premium liquid glass color palettes based on turns progress.
+    Ensures seamless continuous transition from one shade to the other without instant jumps.
+    """
+    t = max(0.0, float(turns))
+    n = len(RING_THEMES)
+    idx1 = int(t) % n
+    idx2 = (idx1 + 1) % n
+    frac = t - int(t)
+    smooth_w = frac * frac * (3.0 - 2.0 * frac)
+
+    t1 = RING_THEMES[idx1]
+    t2 = RING_THEMES[idx2]
+
+    neon = t1["primary_neon"] * (1.0 - smooth_w) + t2["primary_neon"] * smooth_w
+    base = t1["deep_base"] * (1.0 - smooth_w) + t2["deep_base"] * smooth_w
+    ice = t1["ice_col"] * (1.0 - smooth_w) + t2["ice_col"] * smooth_w
+    tint = t1["tint_col"] * (1.0 - smooth_w) + t2["tint_col"] * smooth_w
+    return neon, base, ice, tint
+
+
+_RING_LABEL_LAYOUT_CACHE: dict[tuple, list[tuple[float, float, str]]] = {}
+_RING_HUB_LAYOUT_CACHE: dict[tuple, tuple[float, float, float, float, str]] = {}
+
+
 def render_optical_ring_rgba(
     labels: list[str],
     hover_seg: int = 1,
@@ -943,179 +1059,235 @@ def render_optical_ring_rgba(
     light_angle_deg: float = 135.0,
     dwell_progress: float = 0.0,
     shine_phase: float = 0.22,
+    color_turns: float | None = None,
 ) -> Image.Image:
     if backdrop_rgb is None or backdrop_rgb.shape[:2] != (size, size):
         backdrop_rgb = generate_vivid_desktop_backdrop(size, size)
 
     g = _get_ring_geometry(size)
     base_cache = _get_ring_refracted_base(size, backdrop_rgb)
-    frosted = base_cache["frosted"]
-    tile_rgb = base_cache["base_tiles"].copy()
 
-    x_idx, y_idx = g["x_idx"], g["y_idx"]
-    r, ang = g["r"], g["ang"]
-    gx, gy = g["gx"], g["gy"]
-
-    out_rgb = np.zeros((size, size, 3), dtype=np.float32)
-    out_alpha = np.zeros((size, size), dtype=np.float32)
-
-    inner_stroke = g["inner_stroke"]
-    inner_glow = g["inner_glow"]
     pure_white = np.array([255.0, 255.0, 255.0], dtype=np.float32)
     ice_col = np.array([228.0, 244.0, 255.0], dtype=np.float32)
+
+    # Base inner stroke: dwell mode or fast precomputed idle path
     if 0.01 < dwell_progress <= 1.0:
+        ang = g["ang"]
+        inner_stroke = g["inner_stroke"]
+        inner_glow = g["inner_glow"]
         dwell_span = min(360.0, float(dwell_progress) * 360.0)
         in_dwell = (ang <= dwell_span).astype(np.float32)
-        out_rgb += (1.0 - in_dwell)[..., None] * (inner_stroke[..., None] * pure_white * 0.70 + inner_glow[..., None] * ice_col * 0.45)
+        out_rgb = (1.0 - in_dwell)[..., None] * (inner_stroke[..., None] * pure_white * 0.70 + inner_glow[..., None] * ice_col * 0.45)
         out_rgb += in_dwell[..., None] * (inner_stroke[..., None] * pure_white + inner_glow[..., None] * pure_white * 1.20)
-        out_alpha = np.maximum(out_alpha, np.clip(inner_stroke * (0.75 + 0.25 * in_dwell) + inner_glow * (0.48 + 0.50 * in_dwell), 0.0, 1.0))
+        out_alpha = np.clip(inner_stroke * (0.75 + 0.25 * in_dwell) + inner_glow * (0.48 + 0.50 * in_dwell), 0.0, 1.0)
     else:
-        out_rgb += g.get("inner_stroke_rgb", inner_stroke[..., None] * pure_white * 0.88 + inner_glow[..., None] * ice_col * 0.65)
-        out_alpha = np.maximum(out_alpha, g.get("inner_stroke_alpha", np.clip(inner_stroke * 0.86 + inner_glow * 0.48, 0.0, 1.0)))
+        out_rgb = g["inner_stroke_rgb"].copy()
+        out_alpha = g["inner_stroke_alpha"].copy()
 
+    # Track Arc & Groove - vectorized strictly over track_mask (~35k pixels instead of 211k pixels)
+    track_mask = g["track_mask"]
+    track_core_m = g["track_core_m"]
+    track_bevel_m = g["track_bevel_m"]
+    track_glow_m = g["track_glow_m"]
+    ang_m = g["ang_m"]
     r_track = g["r_outer_ring"]
-    track_core = g.get("track_core", np.exp(-0.5 * (np.abs(r - r_track) / 1.6) ** 2))
-    track_bevel = g.get("track_bevel", np.exp(-0.5 * ((np.abs(r - r_track) - 2.0) / 0.8) ** 2) * 0.45)
-    track_glow = g.get("track_glow", np.exp(-0.5 * (np.abs(r - r_track) / 5.2) ** 2) * 0.60)
-    track_haze = g.get("track_haze", np.exp(-0.5 * (np.abs(r - r_track) / 12.0) ** 2) * 0.35)
-    idle_core = g.get("idle_core", track_core * 0.78 + track_bevel * 0.35)
 
     abs_prog = abs(float(turn_progress))
-    cyan_neon = np.array([0.0, 225.0, 255.0], dtype=np.float32)
-    deep_azure = np.array([12.0, 52.0, 118.0], dtype=np.float32)
+    if color_turns is None:
+        color_turns = max(0.0, float(turn_progress))
+    cyan_neon, deep_azure, ice_col, hover_tint_col = get_ring_theme_colors(color_turns)
+
+    cx = cy = size * 0.5
 
     if 0.005 < abs_prog:
         span_deg = min(360.0, abs_prog * 360.0)
         if turn_progress >= 0:
-            in_arc = (ang <= span_deg).astype(np.float32)
+            in_arc = (ang_m <= span_deg).astype(np.float32)
             head_deg = span_deg
-            # arc_t: 0.0 at starting tail (top), 1.0 at advancing front head
-            arc_t = np.clip(ang / max(0.5, span_deg), 0.0, 1.0)
+            arc_t = np.clip(ang_m / max(0.5, span_deg), 0.0, 1.0)
         else:
-            in_arc = (ang >= (360.0 - span_deg)).astype(np.float32)
+            in_arc = (ang_m >= (360.0 - span_deg)).astype(np.float32)
             head_deg = (360.0 - span_deg) % 360.0
-            arc_t = np.clip((360.0 - ang) / max(0.5, span_deg), 0.0, 1.0)
+            arc_t = np.clip((360.0 - ang_m) / max(0.5, span_deg), 0.0, 1.0)
 
-        # Smooth light-to-dark gradient along the arc
         t_w = (arc_t ** 1.5)[..., None]
-        line_color = np.where(
-            t_w < 0.50,
-            deep_azure * (1.0 - t_w * 2.0) + cyan_neon * (t_w * 2.0),
-            cyan_neon * (1.0 - (t_w - 0.50) * 2.0) + pure_white * ((t_w - 0.50) * 2.0),
-        )
+        m1 = (t_w < 0.50).ravel()
+        m2 = ~m1
+        M = len(ang_m)
+        line_color = np.empty((M, 3), dtype=np.float32)
+        tw1 = t_w[m1] * 2.0
+        tw2 = (t_w[m2] - 0.50) * 2.0
+        line_color[m1] = deep_azure * (1.0 - tw1) + cyan_neon * tw1
+        line_color[m2] = cyan_neon * (1.0 - tw2) + pure_white * tw2
 
-        arc_rgb = line_color * (track_core[..., None] * 0.90 + track_bevel[..., None] * 0.40) + cyan_neon * (track_glow[..., None] * (0.35 + 0.55 * t_w))
-        arc_mask = np.clip(in_arc * (track_core * 0.92 + track_bevel * 0.45 + track_glow * 0.45), 0.0, 1.0)
+        arc_rgb = line_color * (track_core_m[..., None] * 0.90 + track_bevel_m[..., None] * 0.40) + cyan_neon * (track_glow_m[..., None] * (0.35 + 0.55 * t_w))
+        arc_mask = np.clip(in_arc * (track_core_m * 0.92 + track_bevel_m * 0.45 + track_glow_m * 0.45), 0.0, 1.0)
 
         base_groove_rgb = deep_azure * 0.65 + ice_col * 0.35
-        base_groove_alpha = np.clip((1.0 - in_arc) * (track_core * 0.45 + track_glow * 0.20), 0.0, 1.0)
+        base_groove_alpha = np.clip((1.0 - in_arc) * (track_core_m * 0.45 + track_glow_m * 0.20), 0.0, 1.0)
 
-        out_rgb += (1.0 - in_arc)[..., None] * base_groove_rgb * base_groove_alpha[..., None]
-        out_rgb += arc_rgb * in_arc[..., None]
-        out_alpha = np.maximum(out_alpha, np.maximum(base_groove_alpha, arc_mask))
+        t_rgb = (1.0 - in_arc)[..., None] * base_groove_rgb * base_groove_alpha[..., None] + arc_rgb * in_arc[..., None]
+        t_a = np.maximum(base_groove_alpha, arc_mask)
+        out_rgb[track_mask] += t_rgb
+        out_alpha[track_mask] = np.maximum(out_alpha[track_mask], t_a)
 
-        # 3D Liquid-Glass Droplet Head (advancing front bead)
+        # 3D Liquid-Glass Droplet Head (advancing front bead) in tight 120x120 ROI (100x faster than full-frame)
         head_rad = math.radians(head_deg)
-        hx = size * 0.5 + r_track * math.sin(head_rad)
-        hy = size * 0.5 - r_track * math.cos(head_rad)
-        d_head = np.hypot(x_idx - hx, y_idx - hy)
+        hx = cx + r_track * math.sin(head_rad)
+        hy = cy - r_track * math.cos(head_rad)
+        R_b = 60
+        bx0 = max(0, int(hx - R_b))
+        bx1 = min(size, int(hx + R_b) + 1)
+        by0 = max(0, int(hy - R_b))
+        by1 = min(size, int(hy + R_b) + 1)
 
+        sub_x = g["x_idx"][by0:by1, bx0:bx1]
+        sub_y = g["y_idx"][by0:by1, bx0:bx1]
+        d_head = np.hypot(sub_x - hx, sub_y - hy)
         bead_core = smooth_step(9.0, 4.0, d_head)
-        bead_spec = np.exp(-0.5 * (((x_idx - (hx - 2.5)) ** 2 + (y_idx - (hy - 2.5)) ** 2) / 4.0)) * 1.50
+        bead_spec = np.exp(-0.5 * (((sub_x - (hx - 2.5)) ** 2 + (sub_y - (hy - 2.5)) ** 2) / 4.0)) * 1.50
         bead_glow = np.exp(-0.5 * (d_head / 13.0) ** 2) * 0.90
         bead_haze = np.exp(-0.5 * (d_head / 24.0) ** 2) * 0.50
 
         head_color = pure_white * 0.70 + cyan_neon * 0.30
-        out_rgb += (bead_glow[..., None] * cyan_neon + bead_haze[..., None] * deep_azure) * 0.95
-        out_rgb = out_rgb * (1.0 - bead_core[..., None] * 0.85) + (head_color * 0.70 + pure_white * bead_spec[..., None]) * (bead_core[..., None] * 0.85)
-        out_alpha = np.maximum(out_alpha, np.clip(bead_core * 0.98 + bead_glow * 0.70 + bead_haze * 0.35, 0.0, 1.0))
+        sub_rgb = out_rgb[by0:by1, bx0:bx1]
+        sub_rgb += (bead_glow[..., None] * cyan_neon + bead_haze[..., None] * deep_azure) * 0.95
+        sub_rgb = sub_rgb * (1.0 - bead_core[..., None] * 0.85) + (head_color * 0.70 + pure_white * bead_spec[..., None]) * (bead_core[..., None] * 0.85)
+        out_rgb[by0:by1, bx0:bx1] = sub_rgb
+        out_alpha[by0:by1, bx0:bx1] = np.maximum(out_alpha[by0:by1, bx0:bx1], np.clip(bead_core * 0.98 + bead_glow * 0.70 + bead_haze * 0.35, 0.0, 1.0))
     else:
         # Idle track: clean 3D glass outer rim
-        out_rgb += idle_core[..., None] * pure_white * 0.82 + track_glow[..., None] * deep_azure * 0.45
-        out_alpha = np.maximum(out_alpha, np.clip(idle_core * 0.75 + track_glow * 0.35, 0.0, 1.0))
+        idle_core_m = g["idle_core_m"]
+        out_rgb[track_mask] += idle_core_m[..., None] * pure_white * 0.82 + track_glow_m[..., None] * deep_azure * 0.45
+        out_alpha[track_mask] = np.maximum(out_alpha[track_mask], np.clip(idle_core_m * 0.75 + track_glow_m * 0.35, 0.0, 1.0))
 
-    active_seg_mask = np.zeros_like(g["mask"])
-    for idx in range(min(6, len(labels))):
-        if labels[idx]:
-            active_seg_mask = np.where(g["seg_idx"] == idx, 1.0, active_seg_mask)
+    # Segment and button composition
+    btn_idx = g["btn_idx"]
+    base_tiles_btn = base_cache.get("base_tiles_btn")
+    if base_tiles_btn is None:
+        base_tiles_btn = base_cache["base_tiles"][btn_idx].copy()
+    else:
+        base_tiles_btn = base_tiles_btn.copy()
 
-    is_hover_mask = ((g["seg_idx"] == hover_seg) & (active_seg_mask > 0.5)).astype(np.float32)
-    # Luminous Liquid-Glass "Glow Up" on hovered segment
-    glow_lift = is_hover_mask[..., None] * (255.0 - tile_rgb) * (0.45 + 0.25 * g["sweep"][..., None])
-    cyan_tint = np.array([45.0, 205.0, 255.0], dtype=np.float32) * (is_hover_mask[..., None] * 0.22)
-    tile_rgb += glow_lift + cyan_tint
+    seg_btn = g["seg_btn"]
+    sweep_btn = g["sweep_btn"]
+    rim_sharp_btn = g["rim_sharp_btn"]
+    gx_btn = g["gx_btn"]
+    gy_btn = g["gy_btn"]
+    mask_btn = g["mask_btn"]
+
+    # Active labels mask handling
+    num_labels = min(6, len(labels))
+    all_active = (num_labels == 6 and all(labels))
+    if not all_active:
+        active_btn_mask = np.isin(seg_btn, [idx for idx in range(num_labels) if labels[idx]])
+    else:
+        active_btn_mask = slice(None)
+
+    is_h = (seg_btn == hover_seg) if (0 <= hover_seg < 6) else None
+    if is_h is not None:
+        lift = (255.0 - base_tiles_btn[is_h]) * (0.45 + 0.25 * sweep_btn[is_h])
+        base_tiles_btn[is_h] += lift + hover_tint_col * 0.22
 
     l_rad = math.radians(light_angle_deg)
     lx, ly = math.cos(l_rad), math.sin(l_rad)
-    dot_light = np.abs(gx * lx + gy * ly)
+    dot_light = np.abs(gx_btn * lx + gy_btn * ly)
+    if is_h is not None:
+        spec = np.clip(rim_sharp_btn * (0.52 + 0.42 * dot_light + 0.50 * is_h.astype(np.float32)), 0.0, 0.98)[..., None]
+    else:
+        spec = np.clip(rim_sharp_btn * (0.52 + 0.42 * dot_light), 0.0, 0.98)[..., None]
+    base_tiles_btn = base_tiles_btn * (1.0 - spec) + 255.0 * spec
 
-    rim_spec = np.clip(g["rim_sharp"] * (0.52 + 0.42 * dot_light + 0.50 * is_hover_mask), 0.0, 0.98)[..., None]
-    tile_rgb = tile_rgb * (1.0 - rim_spec) + 255.0 * rim_spec
-
-    tile_shadow = g["tile_shadow"] * active_seg_mask
+    # Composite buttons onto out_rgb
+    tile_shadow = g["tile_shadow"]
     out_rgb *= (1.0 - tile_shadow[..., None])
     out_alpha = np.maximum(out_alpha, tile_shadow)
 
-    mask = g["mask"] * active_seg_mask
-    out_rgb = out_rgb * (1.0 - mask[..., None]) + np.clip(tile_rgb, 0.0, 255.0) * mask[..., None]
-    out_alpha = np.maximum(out_alpha, mask * 0.98)
+    if all_active:
+        out_rgb[btn_idx] = out_rgb[btn_idx] * (1.0 - mask_btn) + np.clip(base_tiles_btn, 0.0, 255.0) * mask_btn
+        out_alpha[btn_idx] = np.maximum(out_alpha[btn_idx], mask_btn[:, 0] * 0.98)
+    else:
+        cur_mask_btn = mask_btn * active_btn_mask[..., None]
+        out_rgb[btn_idx] = out_rgb[btn_idx] * (1.0 - cur_mask_btn) + np.clip(base_tiles_btn, 0.0, 255.0) * cur_mask_btn
+        out_alpha[btn_idx] = np.maximum(out_alpha[btn_idx], cur_mask_btn[:, 0] * 0.98)
 
-    cx = cy = size * 0.5
-    centre_mask = r < g["r_inner_ring"]
+    # Centre Hub in tight ROI
     if subtitle:
-        hub_r = g["r_inner_ring"] * 0.90
-        hub_sdf = r - hub_r
-        hub_cov = smooth_step(0.75, -0.75, hub_sdf)
-        hub_mask = hub_cov * 0.26
-        hub_rim = np.exp(-0.5 * (hub_sdf / 0.80) ** 2) * 0.82
-        hub_fill = backdrop_rgb * 0.70 + frosted * 0.30 + np.array([255.0, 255.0, 255.0], dtype=np.float32) * 0.08
-        out_rgb = out_rgb * (1.0 - hub_mask[..., None]) + hub_fill * hub_mask[..., None]
-        out_rgb = out_rgb * (1.0 - hub_rim[..., None] * 0.85) + 255.0 * (hub_rim[..., None] * 0.85)
-        out_alpha = np.maximum(out_alpha, np.clip(hub_mask + hub_rim * 0.75, 0.0, 1.0))
+        hub_roi = g["hub_roi"]
+        hub_mask_sub = g["hub_mask_sub"]
+        hub_rim_sub = g["hub_rim_sub"]
+        hub_fill_sub = base_cache.get("hub_fill_sub")
+        if hub_fill_sub is None:
+            hub_fill_sub = (backdrop_rgb[hub_roi] * 0.70 + base_cache["frosted"][hub_roi] * 0.30 + pure_white * 0.08).astype(np.float32)
+        out_rgb[hub_roi] = (out_rgb[hub_roi] * (1.0 - hub_mask_sub) + hub_fill_sub * hub_mask_sub) * (1.0 - hub_rim_sub) + 255.0 * hub_rim_sub
+        out_alpha[hub_roi] = np.maximum(out_alpha[hub_roi], np.clip(hub_mask_sub[:, 0] + g["hub_rim"][hub_roi] * 0.75, 0.0, 1.0))
 
+    centre_mask = g["centre_mask"]
     out_alpha = np.where(centre_mask, np.maximum(out_alpha, 4.0 / 255.0), out_alpha)
 
-    rgba_arr = np.dstack([
-        np.clip(out_rgb, 0, 255).astype(np.uint8),
-        np.clip(out_alpha * 255.0, 0, 255).astype(np.uint8),
-    ])
+    # High-performance RGBA buffer construction
+    rgba_arr = np.empty((size, size, 4), dtype=np.uint8)
+    rgba_arr[:, :, :3] = np.clip(out_rgb, 0, 255)
+    rgba_arr[:, :, 3] = np.clip(out_alpha * 255.0, 0, 255)
     rgba = Image.fromarray(rgba_arr, mode="RGBA")
-    mask_l = Image.fromarray(np.clip(mask * 255.0, 0, 255).astype(np.uint8), mode="L")
+
+    mask_l = Image.fromarray(np.clip(g["mask"] * 255.0, 0, 255).astype(np.uint8), mode="L")
     shine_sprite = _get_shine_sprite_rgba(size, size, shine_phase, mask_l)
     rgba = Image.alpha_composite(rgba, shine_sprite)
 
+    # UI Text rendering with layout caching
     draw = ImageDraw.Draw(rgba)
     font = load_ui_font(max(15, int(size * 0.038)), bold=True)
     hub_title_font = load_ui_font(max(15, int(size * 0.036)), bold=True)
     hub_sub_font = load_ui_font(max(13, int(size * 0.030)), bold=True)
-    r_label = size * 0.323
-    seg_angles = [0, 60, 120, 180, 240, 300]
-    for idx in range(min(6, len(labels))):
-        if not labels[idx]:
-            continue
-        is_hov = (idx == hover_seg)
-        ar = math.radians(seg_angles[idx])
-        lx = cx + r_label * math.sin(ar)
-        ly = cy - r_label * math.cos(ar)
-        bbox = draw.textbbox((0, 0), labels[idx], font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tx, ty = lx - tw * 0.5, ly - th * 0.5
+
+    label_key = (size, tuple(labels[:6]))
+    cached_labels = _RING_LABEL_LAYOUT_CACHE.get(label_key)
+    if cached_labels is None:
+        cached_labels = []
+        r_label = size * 0.323
+        seg_angles = [0, 60, 120, 180, 240, 300]
+        for idx in range(num_labels):
+            lbl = labels[idx]
+            if not lbl:
+                continue
+            ar = math.radians(seg_angles[idx])
+            lx = cx + r_label * math.sin(ar)
+            ly = cy - r_label * math.cos(ar)
+            bbox = draw.textbbox((0, 0), lbl, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            cached_labels.append((lx - tw * 0.5, ly - th * 0.5, lbl))
+        if len(_RING_LABEL_LAYOUT_CACHE) > 32:
+            _RING_LABEL_LAYOUT_CACHE.clear()
+        _RING_LABEL_LAYOUT_CACHE[label_key] = cached_labels
+
+    for tx, ty, lbl in cached_labels:
         # Jet-Black typography with crisp white drop highlight for 100% readability over any video
-        draw.text((tx, ty + 1.2), labels[idx], font=font, fill=(255, 255, 255, 215))
-        draw.text((tx, ty), labels[idx], font=font, fill=(0, 0, 0, 255))
-        draw.text((tx + 0.5, ty), labels[idx], font=font, fill=(0, 0, 0, 255))
+        draw.text((tx, ty + 1.2), lbl, font=font, fill=(255, 255, 255, 215))
+        draw.text((tx, ty), lbl, font=font, fill=(0, 0, 0, 255))
+        draw.text((tx + 0.5, ty), lbl, font=font, fill=(0, 0, 0, 255))
 
     if subtitle:
-        bbox = draw.textbbox((0, 0), subtitle, font=hub_title_font)
-        tw = bbox[2] - bbox[0]
-        tx, ty = cx - tw * 0.5, cy - 20
+        hint = "Click centre: Back" if staged_count > 0 else "Click: Pick Files"
+        hub_key = (size, subtitle, hint)
+        cached_hub = _RING_HUB_LAYOUT_CACHE.get(hub_key)
+        if cached_hub is None:
+            bbox = draw.textbbox((0, 0), subtitle, font=hub_title_font)
+            tw = bbox[2] - bbox[0]
+            tx, ty = cx - tw * 0.5, cy - 20
+            bbox2 = draw.textbbox((0, 0), hint, font=hub_sub_font)
+            tw2 = bbox2[2] - bbox2[0]
+            tx2, ty2 = cx - tw2 * 0.5, cy + 5
+            cached_hub = (tx, ty, tx2, ty2, hint)
+            if len(_RING_HUB_LAYOUT_CACHE) > 32:
+                _RING_HUB_LAYOUT_CACHE.clear()
+            _RING_HUB_LAYOUT_CACHE[hub_key] = cached_hub
+
+        tx, ty, tx2, ty2, hint = cached_hub
         draw.text((tx, ty + 1.2), subtitle, font=hub_title_font, fill=(255, 255, 255, 220))
         draw.text((tx, ty), subtitle, font=hub_title_font, fill=(0, 0, 0, 255))
         draw.text((tx + 0.5, ty), subtitle, font=hub_title_font, fill=(0, 0, 0, 255))
-        hint = "Click centre: Back" if staged_count > 0 else "Click: Pick Files"
-        bbox2 = draw.textbbox((0, 0), hint, font=hub_sub_font)
-        tw2 = bbox2[2] - bbox2[0]
-        tx2, ty2 = cx - tw2 * 0.5, cy + 5
+
         draw.text((tx2, ty2 + 1.0), hint, font=hub_sub_font, fill=(255, 255, 255, 200))
         draw.text((tx2, ty2), hint, font=hub_sub_font, fill=(12, 16, 24, 255))
 
@@ -1320,10 +1492,6 @@ def _get_window_base(w: int, h: int, backdrop_rgb: np.ndarray, expanded: bool = 
         "mask_l": geom["mask_l"],
     }
     if len(_WINDOW_BASE_CACHE) > 16:
-        _WINDOW_BASE_CACHE.clear()
-    _WINDOW_BASE_CACHE[key] = res
-    return res
-    if len(_WINDOW_BASE_CACHE) > 12:
         _WINDOW_BASE_CACHE.clear()
     _WINDOW_BASE_CACHE[key] = res
     return res
@@ -2206,5 +2374,4 @@ def render_liquid_glass_toast_rgba(
     )
 
     return im
-
 

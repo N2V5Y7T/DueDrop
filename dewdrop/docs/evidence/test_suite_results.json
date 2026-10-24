@@ -7,7 +7,7 @@
     "worker_subprocess_protocol": "PASS (worker_main atomic progress & completion JSON verified)"
   },
   "liquid_glass_optics_and_zero_orange_audit": {
-    "circle_ring_cw_360": "PASS (size=(460, 460), orange_pixels=0, mean_rgb=(86.0, 124.5, 154.6))",
+    "circle_ring_cw_360": "PASS (size=(460, 460), orange_pixels=0, mean_rgb=(86.0, 125.2, 153.3))",
     "circle_ring_ccw_360": "PASS (size=(460, 460), orange_pixels=0, mean_rgb=(88.5, 128.3, 157.2))",
     "options_window_liquid_glass": "PASS (size=(720, 360), orange_pixels=0, mean_rgb=(89.7, 150.9, 216.6))",
     "progress_window_liquid_glass": "PASS (size=(720, 360), orange_pixels=0, mean_rgb=(88.6, 150.4, 216.6))",
@@ -33,7 +33,7 @@
     "pdf_delete_pages": "PASS -> Dew Drop/doc1 (1).pdf (2485 B)",
     "pdf_reverse": "PASS -> Dew Drop/doc1 (2).pdf (2966 B)",
     "pdf_rotate": "PASS -> Dew Drop/doc1 (3).pdf (2967 B)",
-    "pdf_compress": "PASS -> Dew Drop/doc1 (4).pdf (2844 B)",
+    "pdf_compress": "PASS -> Dew Drop/doc1 (4).pdf (3197 B)",
     "pdf_to_text": "PASS -> Dew Drop/doc1.txt (130 B)",
     "pdf_extract_images": "PASS -> Dew Drop/doc1_p1_1.png (810 B)",
     "pdf_strip_meta": "PASS -> Dew Drop/doc1 (5).pdf (2966 B)",
@@ -45,14 +45,14 @@
     "media_to_m4a": "PASS -> Dew Drop/clip.m4a (22814 B)",
     "media_to_wav": "PASS -> Dew Drop/clip.wav (132378 B)",
     "media_to_flac": "PASS -> Dew Drop/clip.flac (88019 B)",
-    "video_compress": "PASS -> Dew Drop/clip (1).mp4 (28661 B)",
+    "video_compress": "PASS -> Dew Drop/clip (1).mp4 (21276 B)",
     "audio_compress": "PASS -> Dew Drop/clip (1).mp3 (18955 B)",
     "media_trim": "PASS -> Dew Drop/clip (2).mp4 (15558 B)",
     "video_to_gif": "PASS -> Dew Drop/clip.gif (31229 B)",
     "video_mute": "PASS -> Dew Drop/clip (3).mp4 (6936 B)",
     "video_frame_png": "PASS -> Dew Drop/clip.png (8098 B)",
     "archive_zip": "PASS -> Dew Drop/photo.zip (410 B)",
-    "archive_targz": "PASS -> Dew Drop/photo.tar.gz (448 B)",
+    "archive_targz": "PASS -> Dew Drop/photo.tar.gz (450 B)",
     "archive_gzip": "PASS -> Dew Drop/notes.txt.gz (58 B)",
     "archive_extract": "PASS -> Dew Drop/photo (extracted 2 files)",
     "json_pretty": "PASS -> Dew Drop/records.json (128 B)",
@@ -81,7 +81,7 @@
     "total": 100,
     "succeeded": 97,
     "failed_cleanly": 3,
-    "elapsed_sec": 0.373,
+    "elapsed_sec": 0.291,
     "status": "PASS"
   },
   "security_m6": {
@@ -89,12 +89,12 @@
     "2_zip_decompression_bomb": "PASS (Refused: Archive exceeds 2,000 file count limit)",
     "3_giant_40mp_image_bomb": "PASS (Refused: Image size (100000000 pixels) exceeds limit of 80000000 pixels, could be decompression bomb DOS attack.)",
     "4_pdf_javascript_autoaction_strip": "PASS (Verified /JavaScript and /OpenAction completely stripped)",
-    "5_ffmpeg_protocol_whitelist_lockdown": "PASS (Blocked external protocol: FFmpeg rejected input or failed: [in#0 @ 0000022fbe7d0940] Error opening input: Invalid data found when processing input)",
+    "5_ffmpeg_protocol_whitelist_lockdown": "PASS (Blocked external protocol: FFmpeg rejected input or failed: [in#0 @ 0000023ab0160700] Error opening input: Invalid data found when processing input)",
     "6_odd_filenames_and_device_names": "PASS (Leading '-', CON/NUL/CONIN$/CONOUT$/CLOCK$, ADS and trailing dots neutralized)",
     "7_macro_enabled_docx_refused": "PASS (Refused: Refused Word document containing executable VBA macros)"
   },
   "cleanroom_audit": {
-    "files_scanned": 878,
+    "files_scanned": 884,
     "forbidden_matches": 0,
     "license_files_present": false,
     "status": "PASS (0 legacy strings, 0 automatic LICENSE/NOTICE files)"

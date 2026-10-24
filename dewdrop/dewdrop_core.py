@@ -41,12 +41,35 @@ def _find_ffmpeg() -> str:
     for candidate in (
         ROOT / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
         ROOT / "assets" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
+        Path(sys.executable).parent / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg"),
     ):
         if candidate.exists():
             return str(candidate)
     which_ff = shutil.which("ffmpeg")
     if which_ff:
         return which_ff
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+        program_data = os.environ.get("ProgramData", "C:\\ProgramData")
+        user_profile = os.environ.get("USERPROFILE", "")
+        if local_app_data:
+            winget_dir = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+            if winget_dir.exists():
+                try:
+                    for f in winget_dir.glob("**/ffmpeg.exe"):
+                        if f.is_file():
+                            return str(f)
+                except Exception:
+                    pass
+        extra_candidates = [
+            Path(program_files) / "ffmpeg" / "bin" / "ffmpeg.exe",
+            Path(program_data) / "chocolatey" / "bin" / "ffmpeg.exe",
+            Path(user_profile) / "scoop" / "shims" / "ffmpeg.exe",
+        ]
+        for cand in extra_candidates:
+            if cand.exists():
+                return str(cand)
     return "/usr/bin/ffmpeg"
 
 
@@ -148,16 +171,17 @@ def compute_ring_placement(cursor_x: int, cursor_y: int, work_area: tuple, dpi_s
 class RotationPager:
     """
     Tracks cumulative 360° clockwise and counter-clockwise cursor rotation around the ring centre
-    with deadzone and hysteresis. Always accumulates rotation angle so the 360° liquid-glass
-    progress arc animates smoothly on both single-page and multi-page rings.
-    Supports allow_negative=False (used in interactive runtime) so rotation always starts
-    clockwise from 0 and cannot go into negative/minus values, while allowing counter-clockwise
-    unwinding back to 0.
-    Completing 1 full clockwise rotation (360°) advances to the next 6 options (Page 1);
-    as soon as rotated anti-clockwise, it immediately returns to the first 6 options (Page 0)
-    and rotates anti-clockwise too, unwinding smoothly to 0 without jumping or going negative.
+    with asymmetric 50% CCW hysteresis. Always accumulates rotation angle so the 360° liquid-glass
+    progress arc and dynamic shade transition animate smoothly across turns.
+
+    1. Clockwise: Completing 1 full clockwise rotation (360°) advances to the next 6 options (Page 1)
+       and starts the next 360° cycle with a smoothly transitioning new color.
+    2. Counter-clockwise: When the next 6 options menu is open, the previous 6 options only return
+       when rotating anti-clockwise more than 50% into the previous cycle (e.g. from 420° down to 180°).
+    3. Hysteresis: If rotating clockwise again from that point, it only advances to the next 6 options
+       when completing the full 360° again from the starting point.
     """
-    def __init__(self, total_items: int, deadzone_radius: float = 38.0, allow_negative: bool = True):
+    def __init__(self, total_items: int, deadzone_radius: float = 28.0, allow_negative: bool = True):
         self.current_page = 0
         self.total_pages = max(1, (max(1, total_items) + 5) // 6)
         self.accumulated_rad = 0.0
@@ -168,59 +192,55 @@ class RotationPager:
         self.total_rad = 0.0
         self.ccw_accumulator = 0.0
 
-    def update_pointer(self, dx: float, dy: float):
-        if math.hypot(dx, dy) < self.deadzone_radius:
-            self.last_angle = None
+    @property
+    def color_turns(self) -> float:
+        """Returns the continuous real-valued turn position for smooth color interpolation."""
+        return max(0.0, self.total_rad / (2.0 * math.pi))
+
+    def apply_delta_rad(self, delta: float) -> int | None:
+        """
+        Applies an angular delta in radians to the pager.
+        Supports both continuous mouse orbiting and mouse roller / touchpad scroll wheel rotation.
+        """
+        if abs(delta) < 1e-5:
             return None
-        angle = math.atan2(dx, -dy)
-        if self.last_angle is not None:
-            delta = angle - self.last_angle
-            while delta > math.pi:
-                delta -= 2.0 * math.pi
-            while delta < -math.pi:
-                delta += 2.0 * math.pi
-            if abs(delta) > 1e-4:
-                self.last_angle = angle
-                if not self.allow_negative:
-                    two_pi = 2.0 * math.pi
-                    prev_page = self.current_page
 
-                    if delta > 0:
-                        self.ccw_accumulator = 0.0
-                        self.total_rad = max(0.0, self.total_rad + delta)
-                        # Completing 360° CW advances to next 6 options
-                        target_page = min(self.total_pages - 1, max(0, int(self.total_rad // two_pi)))
-                        if target_page > self.current_page:
-                            self.current_page = target_page
-                    else:
-                        self.ccw_accumulator += abs(delta)
-                        self.total_rad = max(0.0, self.total_rad + delta)
-                        # Anticlockwise rotation makes it return to previous 6 options
-                        if self.current_page > 0 and self.ccw_accumulator >= 0.08:
-                            self.current_page -= 1
-                            self.ccw_accumulator = 0.0
-                            self.total_rad = min(self.total_rad, float(self.current_page + 1) * two_pi - 0.08)
+        two_pi = 2.0 * math.pi
+        if not self.allow_negative:
+            prev_page = self.current_page
+            max_rad = float(self.total_pages) * two_pi
 
-                    # Continuous 360 rotation with light:
-                    # Within each page or cycle, accumulated_rad moves continuously around the 360° ring
-                    # so the droplet head and specular light never freeze
-                    if self.current_page == 0:
-                        self.accumulated_rad = min(two_pi, self.total_rad % two_pi if self.total_rad > 0 else 0.0)
-                        if self.total_rad >= two_pi and self.current_page == 0:
-                            self.accumulated_rad = two_pi
-                    else:
-                        rem = self.total_rad % two_pi
-                        self.accumulated_rad = rem if rem > 0.02 else two_pi
+            if delta > 0:
+                # Clockwise rotation:
+                self.total_rad = min(max_rad, max(0.0, self.total_rad + delta))
+                # Completing 1 full 360° turn advances to the next 6 options
+                if self.current_page < self.total_pages - 1:
+                    cw_threshold = float(self.current_page + 1) * two_pi - 0.02
+                    if self.total_rad >= cw_threshold:
+                        self.current_page += 1
+            else:
+                # Counter-clockwise (anticlockwise) rotation:
+                self.total_rad = max(0.0, self.total_rad + delta)
+                # When the next 6 option menu is open, the previous 6 only return when rotated
+                # anti-clockwise more than 50% into the previous cycle (e.g. 420° -> 180°)
+                if self.current_page > 0:
+                    ccw_threshold = (float(self.current_page) - 0.5) * two_pi + 0.02
+                    if self.total_rad <= ccw_threshold:
+                        self.current_page -= 1
 
-                    if self.current_page != prev_page:
-                        return self.current_page
-                    return None
-                else:
-                    self.accumulated_rad += delta
+            # Visual 360° progress arc on the ring:
+            page_base = float(self.current_page) * two_pi
+            if self.total_rad >= page_base:
+                self.accumulated_rad = min(two_pi, self.total_rad - page_base)
+            else:
+                prev_page_base = float(self.current_page - 1) * two_pi
+                self.accumulated_rad = max(0.0, min(two_pi, self.total_rad - prev_page_base))
+
+            if self.current_page != prev_page:
+                return self.current_page
+            return None
         else:
-            self.last_angle = angle
-
-        if self.allow_negative:
+            self.accumulated_rad += delta
             threshold = 2.0 * math.pi + 0.18
             if self.accumulated_rad >= threshold:
                 self.accumulated_rad -= 2.0 * math.pi
@@ -236,6 +256,38 @@ class RotationPager:
                     self.current_page = (self.current_page - 1) % self.total_pages
                     return self.current_page
                 return 0
+            return None
+
+    def apply_scroll_delta(self, scroll_units: float, deg_per_notch: float = 30.0) -> int | None:
+        """
+        Converts mouse wheel / touchpad scroll delta into angular rotation degrees/radians.
+        Normal standard notch is WHEEL_DELTA = 120.
+        scroll_units > 0 (wheel down / forward scroll) rotates clockwise.
+        scroll_units < 0 (wheel up / back scroll) rotates counter-clockwise.
+        """
+        rad_per_unit = math.radians(deg_per_notch) / 120.0
+        delta_rad = float(scroll_units) * rad_per_unit
+        return self.apply_delta_rad(delta_rad)
+
+    def update_pointer(self, dx: float, dy: float) -> int | None:
+        if math.hypot(dx, dy) < self.deadzone_radius:
+            return None
+        angle = math.atan2(dx, -dy)
+        if self.last_angle is not None:
+            delta = angle - self.last_angle
+            while delta > math.pi:
+                delta -= 2.0 * math.pi
+            while delta < -math.pi:
+                delta += 2.0 * math.pi
+            if abs(delta) > 0.75 * math.pi:
+                # Flick or crossing near center: update reference without accumulating false half-turn
+                self.last_angle = angle
+                return None
+            if abs(delta) > 1e-4:
+                self.last_angle = angle
+                return self.apply_delta_rad(delta)
+        else:
+            self.last_angle = angle
         return None
 
 
@@ -288,16 +340,45 @@ def resolve_clash_free_output(source_file: Path, new_stem: str, new_ext: str) ->
     Resolves `<source_folder>/Dew Drop/<stem>.<ext>` with automatic `(1)`, `(2)` clash resolution.
     If `<source_folder>/Dew Drop` is not writable (e.g. CD-ROM, locked network share, read-only dir),
     automatically falls back to `~/Documents/Dew Drop` per PROMPT.md §4 and sets `_LAST_FALLBACK_USED`.
+    Preserves exact source drive & folder location whether run locally or from another drive.
     """
     global _LAST_FALLBACK_USED
     _LAST_FALLBACK_USED = False
-    dew_dir = source_file.parent / "Dew Drop"
+
+    src = Path(source_file).resolve()
+    if src.is_dir() and src.name.lower() in ("dew drop", "dewdrop"):
+        parent_dir = src
+    else:
+        parent_dir = src.parent
+
+    # If the file/folder is already inside a Dew Drop folder, save directly inside it without nesting Dew Drop/Dew Drop
+    if parent_dir.name.lower() in ("dew drop", "dewdrop"):
+        dew_dir = parent_dir
+    else:
+        dew_dir = None
+        try:
+            cand1 = parent_dir / "Dew Drop"
+            cand2 = parent_dir / "Dewdrop"
+            if cand1.is_dir():
+                dew_dir = cand1
+            elif cand2.is_dir():
+                dew_dir = cand2
+            else:
+                for child in parent_dir.iterdir():
+                    if child.is_dir() and child.name.lower() in ("dew drop", "dewdrop"):
+                        dew_dir = child
+                        break
+        except Exception:
+            pass
+        if dew_dir is None:
+            dew_dir = parent_dir / "Dew Drop"
+
     try:
         dew_dir.mkdir(parents=True, exist_ok=True)
         probe = dew_dir / f".dewdrop-write-probe-{uuid.uuid4().hex[:8]}"
         probe.write_bytes(b"")
         probe.unlink(missing_ok=True)
-    except Exception:
+    except (PermissionError, OSError):
         _LAST_FALLBACK_USED = True
         dew_dir = Path.home() / "Documents" / "Dew Drop"
         dew_dir.mkdir(parents=True, exist_ok=True)
@@ -684,51 +765,31 @@ def strip_pdf_active_content(writer: pypdf.PdfWriter):
 def recompress_pdf_images(writer: pypdf.PdfWriter, quality: int = 70, max_side: int = 1800):
     seen = set()
     for page in writer.pages:
-        res = page.get("/Resources")
-        if not res:
+        try:
+            for img_file in page.images:
+                try:
+                    ref_id = None
+                    if hasattr(img_file, "indirect_reference") and img_file.indirect_reference:
+                        ref_id = getattr(img_file.indirect_reference, "idnum", None)
+                    if ref_id is not None and ref_id in seen:
+                        continue
+                    if ref_id is not None:
+                        seen.add(ref_id)
+                    im = img_file.image
+                    if im is None:
+                        continue
+                    w, h = im.size
+                    if w < 32 or h < 32 or (w * h) > MAX_IMAGE_PIXELS:
+                        continue
+                    if max_side and max(w, h) > max_side:
+                        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+                    if im.mode not in ("RGB", "L", "RGBA"):
+                        im = im.convert("RGB")
+                    img_file.replace(im, quality=quality, optimize=True)
+                except Exception:
+                    continue
+        except Exception:
             continue
-        res_obj = res.get_object() if hasattr(res, "get_object") else res
-        xobj = res_obj.get("/XObject")
-        if not xobj:
-            continue
-        xobj = xobj.get_object() if hasattr(xobj, "get_object") else xobj
-        for key in list(xobj.keys()):
-            try:
-                obj = xobj[key].get_object()
-                if id(obj) in seen or obj.get("/Subtype") != "/Image":
-                    continue
-                seen.add(id(obj))
-                if "/SMask" in obj or "/Mask" in obj:
-                    continue
-                w = int(obj.get("/Width", 0))
-                h = int(obj.get("/Height", 0))
-                if w < 64 or h < 64 or (w * h) > MAX_IMAGE_PIXELS:
-                    continue
-                raw_bytes = obj.get_data()
-                existing_stream_len = len(getattr(obj, "_data", b"") or raw_bytes)
-                im = Image.open(io.BytesIO(raw_bytes))
-                im.load()
-                if im.mode not in ("RGB", "L"):
-                    im = im.convert("RGB")
-                if max_side and max(im.size) > max_side:
-                    im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-                buf = io.BytesIO()
-                im.save(buf, "JPEG", quality=quality, optimize=True)
-                jpg_bytes = buf.getvalue()
-                if len(jpg_bytes) >= existing_stream_len:
-                    continue
-                new_stream = DecodedStreamObject()
-                new_stream._data = jpg_bytes
-                new_stream[NameObject("/Type")] = NameObject("/XObject")
-                new_stream[NameObject("/Subtype")] = NameObject("/Image")
-                new_stream[NameObject("/Width")] = NumberObject(im.width)
-                new_stream[NameObject("/Height")] = NumberObject(im.height)
-                new_stream[NameObject("/ColorSpace")] = NameObject("/DeviceGray" if im.mode == "L" else "/DeviceRGB")
-                new_stream[NameObject("/BitsPerComponent")] = NumberObject(8)
-                new_stream[NameObject("/Filter")] = NameObject("/DCTDecode")
-                xobj[key] = writer._add_object(new_stream)
-            except Exception:
-                continue
 
 
 def open_safe_pdf(path: Path) -> pypdf.PdfReader:
@@ -1076,7 +1137,11 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
 
     if tool_id == "pdf_compress":
         reader = open_safe_pdf(first)
+        orig_file_size = first.stat().st_size if first.exists() else 0
         level = int(opts.get("level", 2))
+        q = int(opts.get("quality", 65 if level == 2 else (40 if level >= 3 else 85)))
+        max_side = int(opts.get("max_side", 1600 if level == 2 else (1000 if level >= 3 else 2400)))
+
         writer = pypdf.PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
@@ -1095,14 +1160,35 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         except Exception:
             pass
         if level >= 2:
-            q = 70 if level == 2 else 45
-            max_side = 1800 if level == 2 else 1200
             recompress_pdf_images(writer, quality=q, max_side=max_side)
         strip_pdf_active_content(writer)
         writer.add_metadata({})
         out = resolve_clash_free_output(first, stem, "pdf")
-        with open(out, "wb") as f:
-            writer.write(f)
+
+        buf = io.BytesIO()
+        writer.write(buf)
+        compressed_bytes = buf.getvalue()
+
+        if orig_file_size > 0 and len(compressed_bytes) > orig_file_size:
+            w_lossless = pypdf.PdfWriter()
+            for page in reader.pages:
+                w_lossless.add_page(page)
+            for page in w_lossless.pages:
+                try:
+                    page.compress_content_streams()
+                except Exception:
+                    pass
+            strip_pdf_active_content(w_lossless)
+            buf2 = io.BytesIO()
+            w_lossless.write(buf2)
+            compressed_bytes2 = buf2.getvalue()
+            if len(compressed_bytes2) < orig_file_size:
+                compressed_bytes = compressed_bytes2
+            else:
+                out.write_bytes(first.read_bytes())
+                return out
+
+        out.write_bytes(compressed_bytes)
         return out
 
     if tool_id == "pdf_to_text":
@@ -1336,10 +1422,60 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         elif tool_id == "video_frame_png":
             cmd += ["-frames:v", "1"]
 
+        # If extracting audio from a video that has NO audio track (e.g. silent screen recording),
+        # synthesize clean silence for video duration so output is never empty or failed!
+        if tool_id in ("media_to_mp3", "media_to_m4a", "media_to_wav", "media_to_flac") and not is_audio_in:
+            probe = subprocess.run([ff_bin, "-hide_banner", "-i", str(first.resolve())], capture_output=True, text=True)
+            if "Audio:" not in probe.stderr:
+                dur_m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", probe.stderr)
+                dur_sec = 2.0
+                if dur_m:
+                    dur_sec = max(0.5, float(dur_m.group(1))*3600.0 + float(dur_m.group(2))*60.0 + float(dur_m.group(3)))
+                cmd = [
+                    ff_bin, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-t", f"{dur_sec:.3f}", "-i", "anullsrc=r=44100:cl=stereo"
+                ]
+                if tool_id in ("media_to_mp3", "audio_compress"):
+                    cmd += ["-c:a", "libmp3lame", "-b:a", f"{int(opts.get('bitrate', 128))}k"]
+                elif tool_id == "media_to_m4a":
+                    cmd += ["-c:a", "aac", "-b:a", "192k"]
+                elif tool_id == "media_to_wav":
+                    cmd += ["-c:a", "pcm_s16le"]
+                elif tool_id == "media_to_flac":
+                    cmd += ["-c:a", "flac"]
+
         cmd += ["--", str(out.resolve())]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if res.returncode != 0:
+            if out.exists() and out.stat().st_size == 0:
+                try:
+                    out.unlink()
+                except Exception:
+                    pass
             raise RuntimeError(f"FFmpeg rejected input or failed: {res.stderr.strip()}")
+        if not out.exists() or out.stat().st_size == 0:
+            if out.exists():
+                try:
+                    out.unlink()
+                except Exception:
+                    pass
+            raise RuntimeError(f"FFmpeg produced empty output file for {first.name}")
+
+        # Ensure video_compress never increases file size
+        if tool_id == "video_compress" and out.exists():
+            orig_sz = first.stat().st_size if first.exists() else 0
+            if orig_sz > 0 and out.stat().st_size > orig_sz:
+                out.unlink(missing_ok=True)
+                cmd_fb = [
+                    ff_bin, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(first.resolve()),
+                    "-c:v", "libx264", "-preset", "slow", "-crf", "36", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+                    "--", str(out.resolve())
+                ]
+                subprocess.run(cmd_fb, capture_output=True, text=True, timeout=60)
+                if not out.exists() or out.stat().st_size >= orig_sz:
+                    out.write_bytes(first.read_bytes())
         return out
 
     # --- GROUP 5: ARCHIVES (4) ---
@@ -1718,5 +1854,3 @@ def worker_main(job_file: str, result_file: str) -> int:
         "outputs": outputs, "errors": errors, "fallback_used": fallback_any,
     })
     return 0 if len(outputs) > 0 else 1
-
-

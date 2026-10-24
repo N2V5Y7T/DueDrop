@@ -15,4 +15,4 @@ if %ERRORLEVEL% NEQ 0 (
     python -m pip install --user -r requirements.txt
 )
 echo Launching Dewdrop overlay (drag files onto a segment, click a tool, or press Esc / centre hole to close)...
-start "" pythonw dewdrop_runtime.py
+start "" pythonw dewdrop_runtime.py %*

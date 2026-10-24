@@ -12,4 +12,4 @@ if %ERRORLEVEL% NEQ 0 (
 set "TARGET=dewdrop_runtime.py"
 if exist "dewdrop\dewdrop_runtime.py" set "TARGET=dewdrop\dewdrop_runtime.py"
 echo Launching Dewdrop overlay...
-start "" pythonw "%TARGET%"
+start "" pythonw "%TARGET%" %*

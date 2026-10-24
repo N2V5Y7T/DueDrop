@@ -189,7 +189,7 @@ def get_selected_explorer_files() -> list[Path]:
         for line in res.stdout.splitlines():
             s = line.strip()
             if s:
-                p = Path(s)
+                p = Path(s).resolve()
                 if p.exists():
                     paths.append(p)
         return paths
@@ -216,7 +216,7 @@ def pick_folder_dialog_win32(hwnd=None) -> list[Path]:
         selected = filedialog.askdirectory(title="Select Folder to Compress (Make ZIP / Archive)")
         root.destroy()
         if selected:
-            p = Path(selected)
+            p = Path(selected).resolve()
             if p.is_dir():
                 return [p]
     except Exception:
@@ -362,10 +362,10 @@ def pick_files_dialog_win32(hwnd=None) -> list[Path]:
         if not parts:
             return []
         if len(parts) == 1:
-            p = Path(parts[0])
+            p = Path(parts[0]).resolve()
             return [p] if p.exists() else []
-        directory = Path(parts[0])
-        selected = [directory / name for name in parts[1:]]
+        directory = Path(parts[0]).resolve()
+        selected = [(directory / name).resolve() for name in parts[1:]]
         return [p for p in selected if p.exists()]
     except Exception:
         return []
@@ -666,12 +666,14 @@ def get_tool_ui_config(tool_id: str, quality_val: int, chip_idx: int, text_val: 
             "opts": {"rotation": rots[min(c, 2)], "pages": text_val or ""},
         }
     if tool_id == "pdf_compress":
+        q_defaults = [85, 65, 45]
+        q_chosen = q if q != 85 else q_defaults[min(c, 2)]
         return {
             "chips": ["Light (Lossless)", "Balanced (150dpi)", "Strong (Smallest)"],
-            "has_slider": False,
-            "slider_str": None,
+            "has_slider": True,
+            "slider_str": f"Quality {q_chosen}%",
             "text_val": None,
-            "opts": {"level": min(c, 2) + 1},
+            "opts": {"level": min(c, 2) + 1, "quality": q_chosen},
         }
     if tool_id == "video_compress":
         maxhs = [0, 1080, 720]
@@ -802,9 +804,23 @@ def capture_full_desktop_rgb(screen_w: int, screen_h: int) -> np.ndarray | None:
 
 
 _SCREEN_CAPTURE_DCS: dict[tuple[int, int], tuple] = {}
+_WINDOW_CAPTURE_DCS: dict[tuple[int, int], tuple] = {}
 _CAPTURE_GDI_INITIALIZED = False
 _CAPTURE_USER32 = None
 _CAPTURE_GDI32 = None
+_ACTIVE_OVERLAY_HWNDS: set[int] = set()
+
+
+def register_overlay_hwnd(hwnd: int):
+    """Registers an active Dewdrop window to prevent self-capture feedback during screen capture."""
+    if hwnd:
+        _ACTIVE_OVERLAY_HWNDS.add(int(hwnd))
+
+
+def unregister_overlay_hwnd(hwnd: int):
+    """Unregisters a destroyed or dismissed Dewdrop window."""
+    if hwnd:
+        _ACTIVE_OVERLAY_HWNDS.discard(int(hwnd))
 
 
 def _init_capture_gdi():
@@ -821,6 +837,28 @@ def _init_capture_gdi():
     user32.GetDC.restype = wt.HDC
     user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
     user32.ReleaseDC.restype = ctypes.c_int
+
+    if hasattr(user32, "GetWindowDisplayAffinity"):
+        user32.GetWindowDisplayAffinity.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+        user32.GetWindowDisplayAffinity.restype = wt.BOOL
+    if hasattr(user32, "SetWindowDisplayAffinity"):
+        user32.SetWindowDisplayAffinity.argtypes = [wt.HWND, wt.DWORD]
+        user32.SetWindowDisplayAffinity.restype = wt.BOOL
+    if hasattr(user32, "IsWindow"):
+        user32.IsWindow.argtypes = [wt.HWND]
+        user32.IsWindow.restype = wt.BOOL
+    if hasattr(user32, "IsWindowVisible"):
+        user32.IsWindowVisible.argtypes = [wt.HWND]
+        user32.IsWindowVisible.restype = wt.BOOL
+    if hasattr(user32, "PrintWindow"):
+        user32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
+        user32.PrintWindow.restype = wt.BOOL
+    if hasattr(user32, "GetWindow"):
+        user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+        user32.GetWindow.restype = wt.HWND
+    if hasattr(user32, "GetWindowRect"):
+        user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+        user32.GetWindowRect.restype = wt.BOOL
 
     gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
     gdi32.CreateCompatibleDC.restype = wt.HDC
@@ -845,8 +883,9 @@ def _init_capture_gdi():
 
 def capture_live_screen_rect_rgb(x: int, y: int, w: int, h: int) -> np.ndarray | None:
     """
-    Direct ultra-fast (< 1 ms) live screen capture of the desktop area beneath the liquid glass window.
-    Continuously reflects and refracts playing videos, moving windows & changing wallpapers in real time!
+    Direct ultra-fast live screen capture of the desktop area beneath the liquid glass window.
+    Captures live playing videos and background apps directly without rapid affinity toggling,
+    completely eliminating OBS blinking/flickering while preventing self-capture feedback loops!
     """
     if os.name != "nt" or w <= 0 or h <= 0:
         return None
@@ -854,6 +893,22 @@ def capture_live_screen_rect_rgb(x: int, y: int, w: int, h: int) -> np.ndarray |
         _init_capture_gdi()
         user32 = _CAPTURE_USER32 or ctypes.WinDLL("user32")
         gdi32 = _CAPTURE_GDI32 or ctypes.WinDLL("gdi32")
+        import ctypes.wintypes as wt
+
+        # 1. Check if any active overlay is explicitly in stealth/exclusive mode (0x11).
+        # In stealth mode, DWM already excludes the window from BitBlt captures automatically.
+        is_stealth = False
+        if hasattr(user32, "GetWindowDisplayAffinity"):
+            for hw in list(_ACTIVE_OVERLAY_HWNDS):
+                try:
+                    if user32.IsWindow(hw) and user32.IsWindowVisible(hw):
+                        curr_aff = wt.DWORD()
+                        if user32.GetWindowDisplayAffinity(hw, ctypes.byref(curr_aff)):
+                            if curr_aff.value == 0x00000011:
+                                is_stealth = True
+                                break
+                except Exception:
+                    pass
 
         hdc_scr = user32.GetDC(None)
         if not hdc_scr:
@@ -863,7 +918,6 @@ def capture_live_screen_rect_rgb(x: int, y: int, w: int, h: int) -> np.ndarray |
         if key in _SCREEN_CAPTURE_DCS:
             hdc_mem, bits, _ = _SCREEN_CAPTURE_DCS[key]
         else:
-            import ctypes.wintypes as wt
             class BITMAPINFOHEADER(ctypes.Structure):
                 _fields_ = [
                     ("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
@@ -879,30 +933,114 @@ def capture_live_screen_rect_rgb(x: int, y: int, w: int, h: int) -> np.ndarray |
             gdi32.SelectObject(hdc_mem, hbmp)
             _SCREEN_CAPTURE_DCS[key] = (hdc_mem, bits, hbmp)
 
-        # 0x40CC0020 is SRCCOPY | CAPTUREBLT (captures live layered & transparent windows below us)
-        ok = gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_scr, int(x), int(y), 0x40CC0020)
-        raw = ctypes.string_at(bits, int(w * h * 4))
-        user32.ReleaseDC(None, hdc_scr)
+        if is_stealth:
+            # Stealth mode: DewDrop has affinity 0x11, so DWM hardware-excludes it. Direct BitBlt works with zero feedback.
+            try:
+                ok = gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_scr, int(x), int(y), 0x40CC0020)
+                raw = ctypes.string_at(bits, int(w * h * 4))
+            finally:
+                user32.ReleaseDC(None, hdc_scr)
+            if not ok:
+                return None
+            bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
+            return bgra[..., [2, 1, 0]].astype(np.float32)
 
-        if not ok:
-            return None
-        bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
-        return bgra[..., [2, 1, 0]].astype(np.float32)
+        # 2. Record Mode (affinity 0x0):
+        # We MUST NEVER toggle SetWindowDisplayAffinity during capture! Toggling affinity 60 times/sec causes OBS to blink/strobe!
+        # First, search for the active top-level window directly beneath DewDrop in the Z-order.
+        target_win = None
+        GW_HWNDNEXT = 2
+        for overlay_hw in list(_ACTIVE_OVERLAY_HWNDS):
+            if user32.IsWindow(overlay_hw) and user32.IsWindowVisible(overlay_hw):
+                curr = user32.GetWindow(overlay_hw, GW_HWNDNEXT)
+                while curr:
+                    if user32.IsWindowVisible(curr) and curr not in _ACTIVE_OVERLAY_HWNDS:
+                        rc = wt.RECT()
+                        if user32.GetWindowRect(curr, ctypes.byref(rc)):
+                            if not (rc.right <= x or rc.left >= x + w or rc.bottom <= y or rc.top >= y + h):
+                                bw = rc.right - rc.left
+                                bh = rc.bottom - rc.top
+                                if bw > 0 and bh > 0:
+                                    target_win = (curr, rc.left, rc.top, bw, bh)
+                                    break
+                    curr = user32.GetWindow(curr, GW_HWNDNEXT)
+                if target_win:
+                    break
+
+        if target_win:
+            hw_below, bx, by, bw, bh = target_win
+            try:
+                win_key = (int(bw), int(bh))
+                if win_key in _WINDOW_CAPTURE_DCS:
+                    hdc_win, bits_win, _ = _WINDOW_CAPTURE_DCS[win_key]
+                else:
+                    if len(_WINDOW_CAPTURE_DCS) >= 4:
+                        for k in list(_WINDOW_CAPTURE_DCS.keys()):
+                            old_dc, _, old_bmp = _WINDOW_CAPTURE_DCS.pop(k)
+                            try:
+                                gdi32.DeleteObject(old_bmp)
+                                gdi32.DeleteDC(old_dc)
+                            except Exception:
+                                pass
+                    hdc_win = gdi32.CreateCompatibleDC(hdc_scr)
+                    class BITMAPINFOHEADER(ctypes.Structure):
+                        _fields_ = [
+                            ("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                            ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                            ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
+                            ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD),
+                        ]
+                    bmi_w = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), int(bw), -int(bh), 1, 32, 0, int(bw * bh * 4), 0, 0, 0, 0)
+                    bits_win = ctypes.c_void_p()
+                    hbmp_w = gdi32.CreateDIBSection(hdc_win, ctypes.byref(bmi_w), 0, ctypes.byref(bits_win), None, 0)
+                    gdi32.SelectObject(hdc_win, hbmp_w)
+                    _WINDOW_CAPTURE_DCS[win_key] = (hdc_win, bits_win, hbmp_w)
+
+                # PW_RENDERFULLCONTENT = 2: Captures DirectComposition, hardware-accelerated Chrome/YouTube, VLC
+                ok = user32.PrintWindow(hw_below, hdc_win, 2)
+                if ok:
+                    sub_x = int(x - bx)
+                    sub_y = int(y - by)
+                    gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_win, sub_x, sub_y, 0x00CC0020)
+                    raw = ctypes.string_at(bits, int(w * h * 4))
+                    bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
+                    return bgra[..., [2, 1, 0]].astype(np.float32)
+            except Exception:
+                pass
+
+        # 3. If no window is beneath us (e.g. over desktop wallpaper) or PrintWindow fails:
+        # Use BitBlt with plain SRCCOPY (0x00CC0020).
+        # Because DewDrop is a layered window (WS_EX_LAYERED), plain SRCCOPY without CAPTUREBLT
+        # automatically excludes layered windows by GDI definition, eliminating self-capture feedback!
+        try:
+            ok = gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_scr, int(x), int(y), 0x00CC0020)
+            raw = ctypes.string_at(bits, int(w * h * 4))
+        finally:
+            user32.ReleaseDC(None, hdc_scr)
+
+        if ok:
+            bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
+            rgb = bgra[..., [2, 1, 0]].astype(np.float32)
+            if rgb.max() > 0:
+                return rgb
     except Exception:
-        return None
+        pass
+    return None
 
 
 def capture_screen_backdrop_rgb(x: int, y: int, w: int, h: int, record_mode: bool = False) -> np.ndarray:
     """
     Live real-time screen capture of the exact desktop area beneath the liquid glass window.
     Continuously reflects and refracts playing videos, moving windows & changing wallpapers.
+    Works seamlessly in both normal live mode and screen recording mode with zero feedback loop!
     """
     global _DESKTOP_SNAPSHOT_RGB
-    if not record_mode:
-        live_rgb = capture_live_screen_rect_rgb(x, y, w, h)
-        if live_rgb is not None:
-            return live_rgb
+    # Always attempt real-time live capture first (for both normal and record mode)
+    live_rgb = capture_live_screen_rect_rgb(x, y, w, h)
+    if live_rgb is not None:
+        return live_rgb
 
+    # Fallback only if live capture fails (e.g. desktop locked / headless / non-interactive test session)
     if _DESKTOP_SNAPSHOT_RGB is not None:
         sh, sw, _ = _DESKTOP_SNAPSHOT_RGB.shape
         x0 = max(0, min(int(x), sw - w))
@@ -1134,6 +1272,7 @@ def render_ring_surface_rgba(
     light_angle_deg: float = 135.0,
     dwell_progress: float = 0.0,
     shine_phase: float = 0.22,
+    color_turns: float | None = None,
 ) -> Image.Image:
     return render_optical_ring_rgba(
         labels=labels,
@@ -1146,6 +1285,7 @@ def render_ring_surface_rgba(
         light_angle_deg=light_angle_deg,
         dwell_progress=dwell_progress,
         shine_phase=shine_phase,
+        color_turns=color_turns,
     )
 
 
@@ -1311,11 +1451,29 @@ def ensure_demo_sample_file() -> Path:
     return sample_file
 
 
+def ensure_demo_video_file() -> Path:
+    sample_dir = Path(tempfile.gettempdir()) / "Dewdrop_Sample_Files"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    sample_file = sample_dir / "Sample_Video.mp4"
+    if not sample_file.exists():
+        ff = _find_ffmpeg()
+        if ff and Path(ff).exists():
+            subprocess.run([
+                ff, "-nostdin", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                "-t", "3",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                str(sample_file)
+            ], capture_output=True)
+    return sample_file if sample_file.exists() else ensure_demo_sample_file()
+
+
 # ============================================================================
 # 6. INTERACTIVE WIN32 LAYERED OVERLAY GUI (60 FPS BUTTER-SMOOTH)
 # ============================================================================
 
-def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list[Path] | None = None):
+def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list[Path] | None = None, record_mode: bool = True):
     global _DESKTOP_SNAPSHOT_RGB
     import ctypes.wintypes as wt
 
@@ -1354,6 +1512,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
     WM_RBUTTONDOWN = 0x0204
     WM_RBUTTONUP = 0x0205
     WM_MOUSEWHEEL = 0x020A
+    WM_MOUSEHWHEEL = 0x020E
     WM_KEYDOWN = 0x0100
     WM_CHAR = 0x0102
     WM_DROPFILES = 0x0233
@@ -1514,6 +1673,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
     state = {
         "mode": effective_start_mode,
         "start_mode": start_mode,
+        "record_mode": bool(record_mode),
         "window_expanded": False,
         "dragging_slider": False,
         "dragging_window": False,
@@ -1540,7 +1700,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         "page": 0,
         "pager": RotationPager(
             len(active_groups[0][1]) if effective_start_mode == "ring_tools" else len(active_groups),
-            deadzone_radius=38.0,
+            deadzone_radius=28.0,
             allow_negative=False,
         ),
         "staged_files": detected_files,
@@ -1606,8 +1766,9 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         Applies newly selected/dropped files, updates the real photo thumbnail preview,
         and strictly filters the Ring to ONLY the options compatible with those files!
         """
-        state["staged_files"] = files
-        state["current_preview_file"] = files[0] if files else None
+        resolved_files = [Path(f).resolve() for f in files]
+        state["staged_files"] = resolved_files
+        state["current_preview_file"] = resolved_files[0] if resolved_files else None
         state["batch_badge"] = f"1/{len(files)}" if len(files) > 1 else ""
         ranked = filter_and_rank_tools(
             files,
@@ -1621,7 +1782,9 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         state["dwell_progress"] = 0.0
         # Always stay on the main menu ("ring_groups") so all tool categories and 50 features remain visible!
         state["mode"] = "ring_groups"
-        state["pager"] = RotationPager(len(state["groups"]), deadzone_radius=38.0, allow_negative=False)
+        state["pager"] = RotationPager(len(state["groups"]), deadzone_radius=28.0, allow_negative=False)
+
+    _LAYERED_DIB_CACHE: dict[tuple[int, int], tuple] = {}
 
     def push_rgba_to_layered_hwnd(target_hwnd, pil_rgba: Image.Image, x: int, y: int):
         w, h = pil_rgba.size
@@ -1630,12 +1793,19 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         r_ch, g_ch, b_ch, a_ch = pil_rgba.convert("RGBa").split()
         bgra = Image.merge("RGBA", (b_ch, g_ch, r_ch, a_ch)).tobytes()
 
+        key = (w, h)
         hdc_screen = user32.GetDC(None)
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-        bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, w * h * 4, 0, 0, 0, 0)
-        bits = ctypes.c_void_p()
-        hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-        old = gdi32.SelectObject(hdc_mem, hbmp)
+        cached = _LAYERED_DIB_CACHE.get(key)
+        if cached is None:
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, w * h * 4, 0, 0, 0, 0)
+            bits = ctypes.c_void_p()
+            hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+            old = gdi32.SelectObject(hdc_mem, hbmp)
+            cached = (hdc_mem, hbmp, bits, old)
+            _LAYERED_DIB_CACHE[key] = cached
+
+        hdc_mem, hbmp, bits, old = cached
         ctypes.memmove(bits, bgra, len(bgra))
 
         pt_dst = POINT(int(x), int(y))
@@ -1646,9 +1816,6 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
             target_hwnd, hdc_screen, ctypes.byref(pt_dst), ctypes.byref(sz),
             hdc_mem, ctypes.byref(pt_src), 0, ctypes.byref(blend), ULW_ALPHA
         )
-        gdi32.SelectObject(hdc_mem, old)
-        gdi32.DeleteObject(hbmp)
-        gdi32.DeleteDC(hdc_mem)
         user32.ReleaseDC(None, hdc_screen)
 
     def push_rgba_to_hwnd(hwnd, pil_rgba: Image.Image, x: int, y: int):
@@ -1675,6 +1842,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         thwnd = toast_state.get("hwnd")
         if thwnd:
             toast_state["hwnd"] = None
+            unregister_overlay_hwnd(thwnd)
             try:
                 user32.KillTimer(thwnd, 71)
             except Exception:
@@ -1713,17 +1881,19 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
             toast_state["backdrop"] = None
 
         if toast_state["hwnd"] is None:
-            toast_ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+            toast_ex = WS_EX_LAYERED | WS_EX_TOPMOST
             thwnd = user32.CreateWindowExW(
                 toast_ex, toast_cls_name, "DewdropToast", WS_POPUP | WS_VISIBLE,
                 tx, ty, tw, th,
                 None, None, hinst, None
             )
+            toast_affinity = 0x00000000 if state.get("record_mode", True) else 0x00000011
             if hasattr(user32, "SetWindowDisplayAffinity"):
                 try:
-                    user32.SetWindowDisplayAffinity(thwnd, 0x00000011) # WDA_EXCLUDEFROMCAPTURE
+                    user32.SetWindowDisplayAffinity(thwnd, toast_affinity)
                 except Exception:
                     pass
+            register_overlay_hwnd(thwnd)
             toast_state["hwnd"] = thwnd
             user32.SetTimer(thwnd, 71, 16, None)
 
@@ -1946,6 +2116,11 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
 
     def instant_exit():
         try:
+            if "hwnd" in locals() and hwnd:
+                unregister_overlay_hwnd(hwnd)
+        except Exception:
+            pass
+        try:
             dismiss_toast()
         except Exception:
             pass
@@ -1978,7 +2153,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         terminate_worker_tree(state["worker_proc"])
         cleanup_worker_temp()
         state["mode"] = "ring_groups"
-        state["pager"] = RotationPager(len(state["groups"]), deadzone_radius=38.0, allow_negative=False)
+        state["pager"] = RotationPager(len(state["groups"]), deadzone_radius=28.0, allow_negative=False)
         redraw(hwnd)
 
     def trigger_window_exit_sequence(hwnd, is_done: bool):
@@ -2044,7 +2219,13 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
 
     def start_conversion_job(hwnd):
         if not state["staged_files"]:
-            apply_staged_files([ensure_demo_sample_file()])
+            t_id_pre, _, _, _ = current_selected_tool()
+            if t_id_pre in ("media_to_mp4", "media_to_webm", "media_to_mp3", "media_to_m4a",
+                            "media_to_wav", "media_to_flac", "video_compress", "audio_compress",
+                            "media_trim", "video_to_gif", "video_mute", "video_frame_png"):
+                apply_staged_files([ensure_demo_video_file()])
+            else:
+                apply_staged_files([ensure_demo_sample_file()])
 
         g_name = state["groups"][min(state["group_idx"], len(state["groups"]) - 1)][0]
         t_id, t_label, _, _ = current_selected_tool()
@@ -2059,7 +2240,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         res_json = tdir / "result.json"
         job_json.write_text(json.dumps({
             "tool_id": t_id,
-            "files": [str(p) for p in state["staged_files"]],
+            "files": [str(Path(p).resolve()) for p in state["staged_files"]],
             "options": opts,
         }, ensure_ascii=False), encoding="utf-8")
 
@@ -2117,9 +2298,23 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                 sub = "Select Files or Folder"
             else:
                 sub = f"{g_name} (Pg {state['page']+1}/{state['pager'].total_pages})"
-            bg = capture_screen_backdrop_rgb(state["ring_x"], state["ring_y"], 460, 460, record_mode=state.get("record_mode", False))
+            now_t = time.monotonic()
+            cur_pos = (state["ring_x"], state["ring_y"])
+            need_bg_capture = (
+                state.get("cached_ring_bg") is None
+                or state.get("last_ring_bg_pos") != cur_pos
+                or (now_t - state.get("last_ring_bg_time", 0.0) >= 0.066)
+            )
+            if need_bg_capture:
+                bg = capture_screen_backdrop_rgb(state["ring_x"], state["ring_y"], 460, 460, record_mode=state.get("record_mode", False))
+                state["cached_ring_bg"] = bg
+                state["last_ring_bg_time"] = now_t
+                state["last_ring_bg_pos"] = cur_pos
+            else:
+                bg = state["cached_ring_bg"]
             has_more_options = (state["pager"].total_pages > 1)
             turn_prog = max(0.0, state["pager"].accumulated_rad / (2.0 * math.pi)) if has_more_options else 0.0
+            color_turns = getattr(state["pager"], "color_turns", 0.0) if has_more_options else 0.0
             eff_light = state["light_angle_deg"] if has_more_options else 135.0
 
             im = render_ring_surface_rgba(
@@ -2133,6 +2328,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                 light_angle_deg=eff_light,
                 dwell_progress=0.0,
                 shine_phase=state["shine_phase"],
+                color_turns=color_turns,
             )
             push_rgba_to_hwnd(hwnd, im, state["ring_x"], state["ring_y"])
         elif mode == "options_window":
@@ -2187,7 +2383,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
             state["group_idx"] = seg
             state["page"] = 0
             tools = state["groups"][seg][1]
-            state["pager"] = RotationPager(len(tools), deadzone_radius=38.0, allow_negative=False)
+            state["pager"] = RotationPager(len(tools), deadzone_radius=28.0, allow_negative=False)
             state["mode"] = "ring_tools"
             state["entered_tools_at"] = time.monotonic()
             state["dwell_target"] = None
@@ -2211,9 +2407,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                 finally:
                     state["in_dialog"] = False
                 if picked:
-                    state["staged_files"] = picked
-                    state["current_preview_file"] = picked[0]
-                    state["batch_badge"] = f"1/{len(picked)}" if len(picked) > 1 else ""
+                    apply_staged_files(picked)
                 else:
                     show_toast_notification(
                         title="Selection Required",
@@ -2253,7 +2447,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                 n = shell32.DragQueryFileW(hdrop, i, None, 0)
                 buf = ctypes.create_unicode_buffer(n + 1)
                 shell32.DragQueryFileW(hdrop, i, buf, n + 1)
-                p = Path(buf.value)
+                p = Path(buf.value).resolve()
                 if p.exists():
                     dropped.append(p)
             shell32.DragFinish(hdrop)
@@ -2348,6 +2542,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                     if new_page is not None:
                         state["page"] = new_page
 
+                prev_hov = state["hover_seg"]
                 if 92.0 <= r <= 220.0:
                     ang = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
                     seg = int(((ang + 30.0) % 360.0) // 60.0) % 6
@@ -2357,7 +2552,8 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                     if state["hover_seg"] != -1:
                         state["hover_seg"] = -1
 
-                if now - state["last_mousemove_redraw"] >= 0.016:
+                state["last_client_mousemove"] = now
+                if (state["hover_seg"] != prev_hov) or (now - state["last_mousemove_redraw"] >= 0.012):
                     state["last_mousemove_redraw"] = now
                     redraw(hwnd)
             elif mode in ("options_window", "progress_window"):
@@ -2402,13 +2598,49 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
             return 0
             return 0
 
-        if msg == WM_MOUSEWHEEL:
-            if state["mode"] == "ring_tools":
-                tools = state["groups"][min(state["group_idx"], len(state["groups"]) - 1)][1]
-                total_pages = max(1, (len(tools) + 5) // 6)
-                delta = ctypes.c_short((wparam >> 16) & 0xFFFF).value
-                state["page"] = (state["page"] + (-1 if delta > 0 else 1)) % total_pages
-                redraw(hwnd)
+        if msg in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+            raw_delta = ctypes.c_short((wparam >> 16) & 0xFFFF).value
+            if raw_delta == 0:
+                return 0
+
+            mode = state["mode"]
+            if mode in ("ring_groups", "ring_tools"):
+                has_more_options = (state["pager"].total_pages > 1)
+                # In WM_MOUSEWHEEL / WM_MOUSEHWHEEL, lparam holds screen cursor coordinates (x, y)
+                pt_scr_x = ctypes.c_short(lparam & 0xFFFF).value
+                pt_scr_y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                dx = float(pt_scr_x) - (state["ring_x"] + 230.0)
+                dy = float(pt_scr_y) - (state["ring_y"] + 230.0)
+                r = math.hypot(dx, dy)
+
+                # Cursor is in the circular menu (whether on an option segment, outer track, or hub)
+                if r <= 245.0:
+                    state["last_active"] = time.monotonic()
+                    # Keep track of hovered segment if hovering over an option button
+                    if 92.0 <= r <= 220.0:
+                        ang = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+                        seg = int(((ang + 30.0) % 360.0) // 60.0) % 6
+                        state["hover_seg"] = seg
+
+                    if has_more_options:
+                        # Standard WM_MOUSEWHEEL: negative raw_delta is roll DOWN (forward scroll / clockwise)
+                        # positive raw_delta is roll UP (backward scroll / counter-clockwise)
+                        # WM_MOUSEHWHEEL: positive raw_delta is tilt RIGHT (clockwise)
+                        if msg == WM_MOUSEHWHEEL:
+                            scroll_units = float(raw_delta)
+                        else:
+                            scroll_units = -float(raw_delta)
+
+                        # Accurately transform normal scroll length into roller degrees
+                        # Standard notch (120 units) = 30.0 degrees (2 notches = 1 option segment; 12 notches = 360° full turn)
+                        new_page = state["pager"].apply_scroll_delta(scroll_units, deg_per_notch=30.0)
+                        if new_page is not None:
+                            state["page"] = new_page
+
+                        # Light angle dynamically follows the advancing droplet bead on the track
+                        bead_deg = math.degrees(state["pager"].accumulated_rad)
+                        state["light_angle_deg"] = (bead_deg + 270.0) % 360.0
+                        redraw(hwnd)
             return 0
 
         if msg == WM_LBUTTONDOWN:
@@ -2437,7 +2669,7 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                         state["mode"] = "ring_groups"
                         state["dwell_target"] = None
                         state["dwell_progress"] = 0.0
-                        state["pager"] = RotationPager(len(state["groups"]), deadzone_radius=38.0, allow_negative=False)
+                        state["pager"] = RotationPager(len(state["groups"]), deadzone_radius=28.0, allow_negative=False)
                         redraw(hwnd)
                     else:
                         if not state["staged_files"]:
@@ -2650,14 +2882,16 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                 start_morph(hwnd, to_island=(state["mode"] != "island"))
             elif wparam == 0x77:  # VK_F8: Toggle Demo Record Mode vs Live Mode
                 state["record_mode"] = not state.get("record_mode", False)
+                affinity = 0x00000000 if state["record_mode"] else 0x00000011
                 if hasattr(user32, "SetWindowDisplayAffinity"):
-                    affinity = 0x00000000 if state["record_mode"] else 0x00000011
                     user32.SetWindowDisplayAffinity(hwnd, affinity)
+                    thwnd = toast_state.get("hwnd")
+                    if thwnd and hasattr(user32, "IsWindow") and user32.IsWindow(thwnd):
+                        user32.SetWindowDisplayAffinity(thwnd, affinity)
                 if state["record_mode"]:
-                    _DESKTOP_SNAPSHOT_RGB = capture_full_desktop_rgb(screen_w, screen_h)
-                    show_toast_notification("Record Mode Active", "Dewdrop is visible to screen recorders (F8 to toggle)")
+                    show_toast_notification("Record Mode Active", "Dewdrop is visible to screen recorders (OBS/Game Bar) with live video")
                 else:
-                    show_toast_notification("Live Glass Active", "Real-time YouTube video & app refraction active")
+                    show_toast_notification("Live Glass Active", "Standard mode active (excluded from screen capture)")
                 redraw(hwnd)
                 return 0
             return 0
@@ -2708,24 +2942,28 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                 if state["mode"] in ("ring_groups", "ring_tools"):
                     has_more_options = (state["pager"].total_pages > 1)
                     if has_more_options:
-                        # Track cursor anywhere on screen relative to ring center only when more options exist!
-                        pt_scr = POINT()
-                        if user32.GetCursorPos(ctypes.byref(pt_scr)):
-                            dx_scr = float(pt_scr.x) - (state["ring_x"] + 230.0)
-                            dy_scr = float(pt_scr.y) - (state["ring_y"] + 230.0)
-                            r_scr = math.hypot(dx_scr, dy_scr)
-                            prev_light = state["light_angle_deg"]
-                            if r_scr > 8.0:
-                                state["light_angle_deg"] = (math.degrees(math.atan2(dy_scr, dx_scr)) + 360.0) % 360.0
-                            prev_rad = state["pager"].accumulated_rad
-                            new_page = state["pager"].update_pointer(dx_scr, dy_scr)
-                            if new_page is not None:
-                                state["page"] = new_page
-                            if (abs(state["pager"].accumulated_rad - prev_rad) > 1e-4) or (abs(state["light_angle_deg"] - prev_light) > 0.8) or (new_page is not None):
-                                state["last_active"] = now
-                                if now - state["last_mousemove_redraw"] >= 0.016:
-                                    state["last_mousemove_redraw"] = now
-                                    redraw(hwnd)
+                        # Only track cursor via GetCursorPos if client mouse has been idle (e.g. cursor outside window)
+                        # Prevents duplicate delta accumulation and conflict between client WM_MOUSEMOVE and screen timer
+                        if (now - state.get("last_client_mousemove", 0.0)) >= 0.035:
+                            pt_scr = POINT()
+                            if user32.GetCursorPos(ctypes.byref(pt_scr)):
+                                dx_scr = float(pt_scr.x) - (state["ring_x"] + 230.0)
+                                dy_scr = float(pt_scr.y) - (state["ring_y"] + 230.0)
+                                r_scr = math.hypot(dx_scr, dy_scr)
+                                prev_light = state["light_angle_deg"]
+                                if r_scr > 8.0:
+                                    state["light_angle_deg"] = (math.degrees(math.atan2(dy_scr, dx_scr)) + 360.0) % 360.0
+                                prev_rad = state["pager"].accumulated_rad
+                                prev_color = getattr(state["pager"], "color_turns", 0.0)
+                                new_page = state["pager"].update_pointer(dx_scr, dy_scr)
+                                if new_page is not None:
+                                    state["page"] = new_page
+                                curr_color = getattr(state["pager"], "color_turns", 0.0)
+                                if (abs(state["pager"].accumulated_rad - prev_rad) > 1e-4) or (abs(curr_color - prev_color) > 1e-4) or (abs(state["light_angle_deg"] - prev_light) > 0.8) or (new_page is not None):
+                                    state["last_active"] = now
+                                    if now - state["last_mousemove_redraw"] >= 0.012:
+                                        state["last_mousemove_redraw"] = now
+                                        redraw(hwnd)
 
                 if state["done_at"] > 0 and not state["job_active"] and state["mode"] in ("progress_window", "island"):
                     delay = 2.0 if state["mode"] == "progress_window" else 0.0
@@ -2896,17 +3134,17 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
     state["ring_x"] = cx - 230
     state["ring_y"] = cy - 230
 
-    ex_style = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+    ex_style = WS_EX_LAYERED | WS_EX_TOPMOST
     hwnd = user32.CreateWindowExW(
         ex_style, cls_name, APP_NAME, WS_POPUP | WS_VISIBLE,
         state["ring_x"], state["ring_y"], 860, 460,
         None, None, hinst, None
     )
+    register_overlay_hwnd(hwnd)
     if hasattr(user32, "SetWindowDisplayAffinity"):
         try:
-            # WDA_EXCLUDEFROMCAPTURE (0x11): Tells DWM to exclude Dewdrop from screen captures
-            # so capture_live_screen_rect_rgb captures the real video/desktop behind Dewdrop with ZERO feedback loop!
-            user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+            initial_affinity = 0x00000000 if state.get("record_mode", True) else 0x00000011
+            user32.SetWindowDisplayAffinity(hwnd, initial_affinity)
         except Exception:
             pass
     try:
@@ -3000,10 +3238,11 @@ def main():
     elif "--preview-island" in args:
         start_mode = "island"
 
-    cli_files = [Path(a) for a in args if not a.startswith("-") and Path(a).is_file()]
+    start_record_mode = not bool("--stealth" in args or "--exclude-capture" in args)
+    cli_files = [Path(a).resolve() for a in args if not a.startswith("-") and Path(a).is_file()]
 
     if os.name == "nt":
-        run_windows_interactive_gui(start_mode=start_mode, cli_files=cli_files)
+        run_windows_interactive_gui(start_mode=start_mode, cli_files=cli_files, record_mode=start_record_mode)
     else:
         print("Dewdrop Clean-Room Runtime: verifying crystal-clear liquid-glass surfaces on non-Windows host...")
         from tests.run_cleanroom_verification import run_all_tests
