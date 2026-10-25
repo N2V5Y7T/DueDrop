@@ -28,6 +28,27 @@ APP_NAME = "Dew Drop"
 APP_DIR_NAME = "DewDrop"
 APP_VERSION = "1.0.0"
 DEFAULT_HOTKEY = "CTRL+ALT+Z"
+INSTALL_MARKER_FILE = ".dewdrop-install"
+FORBIDDEN_CHARS = set('"&|<>^%')
+
+
+def validate_no_injection(value: str, field_name: str = "Value"):
+    """Rejects special shell/batch injection characters in paths or hotkeys."""
+    bad = [c for c in FORBIDDEN_CHARS if c in value]
+    if bad:
+        raise ValueError(
+            f"{field_name} contains prohibited characters ({''.join(bad)}): {value}"
+        )
+
+
+def sanitize_install_dir(p: Path | str) -> Path:
+    """Forces installation directory to end in 'DewDrop' and validates characters."""
+    raw = str(p).strip()
+    validate_no_injection(raw, "Installation directory")
+    path = Path(raw).resolve()
+    if path.name != APP_DIR_NAME:
+        path = path / APP_DIR_NAME
+    return path
 
 
 def get_default_install_dir() -> Path:
@@ -283,12 +304,14 @@ def register_uninstaller_in_registry(install_dir: Path, hotkey: str):
     """
     Registers Dewdrop in Windows Settings (Add or Remove Programs).
     """
+    validate_no_injection(str(install_dir), "Installation directory")
+    validate_no_injection(hotkey, "Hotkey")
     try:
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\DewDrop"
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
-            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "Dewdrop")
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, APP_NAME)
             winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, APP_VERSION)
-            winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "Dewdrop Project")
+            winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "N2V5Y7T")
             winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, str(install_dir))
             ico = install_dir / "assets" / "icon.ico"
             if ico.exists():
@@ -305,32 +328,104 @@ def register_uninstaller_in_registry(install_dir: Path, hotkey: str):
 def write_uninstaller_script(install_dir: Path):
     """
     Creates a clean, robust Uninstall.bat script in the installation directory.
+    Validates the .dewdrop-install marker and deletes only known installed files.
     """
+    validate_no_injection(str(install_dir), "Installation directory")
     uninstall_content = f"""@echo off
-setlocal
+setlocal EnableDelayedExpansion
+
+:: 1. Re-run from %TEMP% so script does not lock or delete itself mid-run
+if /i not "%~dp0"=="%TEMP%\\" (
+    copy /y "%~f0" "%TEMP%\\dewdrop_uninstall_runner.bat" >nul 2>nul
+    "%TEMP%\\dewdrop_uninstall_runner.bat" %*
+    exit /b %ERRORLEVEL%
+)
+
 echo ============================================================
-echo Uninstalling Dewdrop...
+echo                  Uninstalling Dew Drop
 echo ============================================================
+echo.
 
-taskkill /F /IM dewdrop.exe 2>nul
-taskkill /F /IM pythonw.exe /FI "WINDOWTITLE eq Dewdrop*" 2>nul
+:: 2. Terminate running processes
+echo Stopping running Dew Drop processes...
+taskkill /IM dewdrop.exe /F >nul 2>nul
+taskkill /IM pythonw.exe /FI "WINDOWTITLE eq Dew Drop*" /F >nul 2>nul
+taskkill /IM pythonw.exe /FI "WINDOWTITLE eq Dewdrop*" /F >nul 2>nul
 
-echo Removing shortcuts...
-del /F /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Dewdrop.lnk" 2>nul
-del /F /Q "%USERPROFILE%\\Desktop\\Dewdrop.lnk" 2>nul
+:: 3. Resolve Installation Location
+set "TARGET_DIR="
 
-echo Removing registry entries...
-reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Dewdrop" /f 2>nul
+:: 3a. Read from registry (DewDrop or Dewdrop)
+for /f "tokens=2* skip=2" %%A in ('reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DewDrop" /v InstallLocation 2^>nul') do set "TARGET_DIR=%%B"
+if not defined TARGET_DIR (
+    for /f "tokens=2* skip=2" %%A in ('reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Dewdrop" /v InstallLocation 2^>nul') do set "TARGET_DIR=%%B"
+)
 
-echo Removing program files...
-cd /d "%TEMP%"
-timeout /t 1 /nobreak >nul
-rmdir /S /Q "{install_dir}" 2>nul
+:: 3b. Fallback to passed argument or default installation location
+if not defined TARGET_DIR (
+    if exist "%~1\\.dewdrop-install" set "TARGET_DIR=%~1"
+)
+if not defined TARGET_DIR (
+    if exist "{install_dir}\\.dewdrop-install" set "TARGET_DIR={install_dir}"
+)
+if not defined TARGET_DIR (
+    if exist "%LOCALAPPDATA%\\Programs\\DewDrop\\.dewdrop-install" set "TARGET_DIR=%LOCALAPPDATA%\\Programs\\DewDrop"
+)
+if not defined TARGET_DIR (
+    if exist "%LOCALAPPDATA%\\Programs\\Dewdrop\\.dewdrop-install" set "TARGET_DIR=%LOCALAPPDATA%\\Programs\\Dewdrop"
+)
+
+:: 4. Verify installation marker before any deletion
+if not defined TARGET_DIR (
+    echo [ERROR] Could not locate an installed Dew Drop directory.
+    exit /b 1
+)
+
+if not exist "%TARGET_DIR%\\.dewdrop-install" (
+    echo [ERROR] Safety check failed:
+    echo "%TARGET_DIR%"
+    echo does not contain the .dewdrop-install marker file.
+    echo Refusing to delete an unverified directory.
+    exit /b 1
+)
+
+:: 5. Remove shortcuts
+echo Removing application shortcuts...
+del /F /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Dew Drop.lnk" >nul 2>nul
+del /F /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Dewdrop.lnk" >nul 2>nul
+del /F /Q "%USERPROFILE%\\Desktop\\Dew Drop.lnk" >nul 2>nul
+del /F /Q "%USERPROFILE%\\Desktop\\Dewdrop.lnk" >nul 2>nul
+del /F /Q "%USERPROFILE%\\OneDrive\\Desktop\\Dew Drop.lnk" >nul 2>nul
+del /F /Q "%USERPROFILE%\\OneDrive\\Desktop\\Dewdrop.lnk" >nul 2>nul
+
+:: 6. Remove registry entries
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\DewDrop" /f >nul 2>nul
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Dewdrop" /f >nul 2>nul
+
+:: 7. Delete only known installed files/subfolders
+echo Removing verified installed files...
+del /F /Q "%TARGET_DIR%\\dewdrop.exe" >nul 2>nul
+del /F /Q "%TARGET_DIR%\\dewdrop_core.py" >nul 2>nul
+del /F /Q "%TARGET_DIR%\\dewdrop_runtime.py" >nul 2>nul
+del /F /Q "%TARGET_DIR%\\liquid_optics.py" >nul 2>nul
+del /F /Q "%TARGET_DIR%\\requirements.txt" >nul 2>nul
+del /F /Q "%TARGET_DIR%\\settings.json" >nul 2>nul
+del /F /Q "%TARGET_DIR%\\Uninstall.bat" >nul 2>nul
+del /F /Q "%TARGET_DIR%\\.dewdrop-install" >nul 2>nul
+
+if exist "%TARGET_DIR%\\assets" rmdir /S /Q "%TARGET_DIR%\\assets" >nul 2>nul
+if exist "%TARGET_DIR%\\tests" rmdir /S /Q "%TARGET_DIR%\\tests" >nul 2>nul
+if exist "%TARGET_DIR%\\_internal" rmdir /S /Q "%TARGET_DIR%\\_internal" >nul 2>nul
+
+:: Delete folder ONLY if completely empty (never a blind recursive rmdir)
+rmdir "%TARGET_DIR%" >nul 2>nul
 
 echo.
-echo Dewdrop has been successfully uninstalled.
-timeout /t 3
-exit
+echo ============================================================
+echo [SUCCESS] Dew Drop has been completely uninstalled.
+echo ============================================================
+timeout /t 2 >nul
+exit /b 0
 """
     bat_path = install_dir / "Uninstall.bat"
     bat_path.write_text(uninstall_content, encoding="utf-8")
@@ -363,6 +458,19 @@ def deploy_dewdrop(
     Performs full deployment into install_dir.
     """
     try:
+        validate_no_injection(str(install_dir), "Installation directory")
+        validate_no_injection(hotkey, "Hotkey")
+        install_dir = sanitize_install_dir(install_dir)
+
+        # Refuse an existing non-empty folder that lacks .dewdrop-install marker
+        if install_dir.exists() and any(install_dir.iterdir()):
+            marker = install_dir / INSTALL_MARKER_FILE
+            if not marker.is_file():
+                raise ValueError(
+                    f"Destination directory '{install_dir}' is not empty and lacks '{INSTALL_MARKER_FILE}'. "
+                    "Refusing to overwrite an unverified folder."
+                )
+
         # Terminate any running Dewdrop processes to prevent file locking
         if os.name == "nt":
             try:
@@ -371,6 +479,7 @@ def deploy_dewdrop(
                 pass
 
         install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / INSTALL_MARKER_FILE).write_text("dewdrop-install-marker\nversion=1.0.0\n", encoding="utf-8")
         log_callback(f"Target directory ready: {install_dir}")
 
         source_dir = Path(__file__).resolve().parent.parent

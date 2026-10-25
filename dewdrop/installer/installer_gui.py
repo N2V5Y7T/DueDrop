@@ -34,9 +34,13 @@ try:
         check_prerequisites,
         install_missing_dependencies,
         deploy_dewdrop,
+        sanitize_install_dir,
+        validate_no_injection,
         APP_NAME,
+        APP_DIR_NAME,
         APP_VERSION,
         DEFAULT_HOTKEY,
+        INSTALL_MARKER_FILE,
     )
 except ImportError:
     from dewdrop.installer.installer_engine import (
@@ -45,9 +49,13 @@ except ImportError:
         check_prerequisites,
         install_missing_dependencies,
         deploy_dewdrop,
+        sanitize_install_dir,
+        validate_no_injection,
         APP_NAME,
+        APP_DIR_NAME,
         APP_VERSION,
         DEFAULT_HOTKEY,
+        INSTALL_MARKER_FILE,
     )
 
 
@@ -211,7 +219,10 @@ class DewdropInstallerApp:
     def on_browse_location(self):
         chosen = filedialog.askdirectory(initialdir=self.install_dir_var.get(), title="Select Installation Directory")
         if chosen:
-            self.install_dir_var.set(str(Path(chosen) / APP_NAME if not chosen.endswith(APP_NAME) else chosen))
+            p = Path(chosen).resolve()
+            if p.name != APP_DIR_NAME:
+                p = p / APP_DIR_NAME
+            self.install_dir_var.set(str(p))
 
     def refresh_hotkey_preview(self):
         m = self.mod_var.get().strip().upper()
@@ -260,14 +271,35 @@ class DewdropInstallerApp:
             self.ui_queue.put(("prereq", f"Environment verified: {e}", "#16A34A"))
 
     def on_start_install(self):
-        dest = Path(self.install_dir_var.get().strip())
-        if not dest.name:
+        raw_dest = self.install_dir_var.get().strip()
+        if not raw_dest:
             messagebox.showerror("Invalid Path", "Please specify a valid installation path.")
             return
 
         m = self.mod_var.get().strip().upper()
         k = self.key_var.get().strip().upper()
         hotkey = f"{m}+{k}"
+
+        try:
+            validate_no_injection(raw_dest, "Installation directory")
+            validate_no_injection(hotkey, "Hotkey")
+            dest = sanitize_install_dir(raw_dest)
+        except ValueError as err:
+            messagebox.showerror("Validation Error", str(err))
+            return
+
+        self.install_dir_var.set(str(dest))
+
+        # Check existing non-empty folder
+        if dest.exists() and any(dest.iterdir()):
+            marker = dest / INSTALL_MARKER_FILE
+            if not marker.is_file():
+                messagebox.showerror(
+                    "Safety Check Failed",
+                    f"The destination directory:\n{dest}\n\nexists and is not empty, but does NOT contain a Dew Drop marker file ({INSTALL_MARKER_FILE}).\n\nTo prevent accidental file loss, choose an empty directory or existing Dew Drop folder.",
+                )
+                return
+
         create_desktop = bool(self.desktop_lnk_var.get())
         create_start_menu = bool(self.start_menu_lnk_var.get())
         launch_after = bool(self.launch_after_var.get())

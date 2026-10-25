@@ -26,9 +26,15 @@ import pypdf
 from pypdf.generic import ArrayObject, DecodedStreamObject, NameObject, NumberObject
 import docx
 from docx.shared import Inches, Pt
+from xml.sax.saxutils import escape as xml_escape
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.lib.utils import ImageReader
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors as rl_colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -90,6 +96,68 @@ def _find_ffmpeg() -> str:
 def has_ffmpeg() -> bool:
     ff = _find_ffmpeg()
     return bool(ff and Path(ff).exists())
+
+
+def _ffmpeg_base_cmd(ff_bin: str) -> list[str]:
+    """
+    Standard base invocation for FFmpeg enforcing security and non-interactive silence.
+    Enforces protocol whitelist to block remote network calls and local file disclosure vectors.
+    """
+    return [
+        ff_bin,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-protocol_whitelist", "file,pipe",
+    ]
+
+
+MAX_TEXT_INPUT_BYTES = 100 * 1024 * 1024
+
+
+def read_text_smart(path_or_bytes: Path | str | bytes) -> tuple[str, str]:
+    """
+    Robust text file reader that detects encoding in strict priority order:
+    1. BOM checks: UTF-8-SIG (EF BB BF), UTF-32 (FF FE 00 00 / 00 00 FE FF), UTF-16 (FF FE / FE FF).
+    2. Strict UTF-8 without BOM.
+    3. Windows CP1252 (handles Western European accented chars and € without CJK corruption).
+    4. Latin-1 fallback (never fails).
+    Never decodes UTF-16 without a valid BOM to prevent CP1252 text from turning into CJK garbage.
+    Enforces 100 MiB input size limit.
+    """
+    if isinstance(path_or_bytes, (str, Path)):
+        p = Path(path_or_bytes)
+        sz = p.stat().st_size
+        if sz > MAX_TEXT_INPUT_BYTES:
+            raise ValueError(f"Input file '{p.name}' exceeds 100 MiB limit ({sz} bytes)")
+        raw = p.read_bytes()
+    else:
+        raw = bytes(path_or_bytes)
+        if len(raw) > MAX_TEXT_INPUT_BYTES:
+            raise ValueError(f"Input text data exceeds 100 MiB limit ({len(raw)} bytes)")
+
+    # 1. BOM checks first
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig"), "utf-8-sig"
+    if raw.startswith(b"\xff\xfe\x00\x00") or raw.startswith(b"\x00\x00\xfe\xff"):
+        return raw.decode("utf-32"), "utf-32"
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16"), "utf-16"
+
+    # 2. Strict UTF-8
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+
+    # 3. CP1252
+    try:
+        return raw.decode("cp1252"), "cp1252"
+    except UnicodeDecodeError:
+        pass
+
+    # 4. Latin-1 fallback
+    return raw.decode("latin-1"), "latin-1"
 
 
 # ============================================================================
@@ -347,6 +415,17 @@ def sanitize_rel_path(rel_name: str, target_root: Path) -> Path:
 
 
 _LAST_FALLBACK_USED = False
+_LAST_NOTICE = ""
+
+
+def get_last_notice() -> str:
+    global _LAST_NOTICE
+    return _LAST_NOTICE
+
+
+def set_last_notice(msg: str):
+    global _LAST_NOTICE
+    _LAST_NOTICE = msg
 
 
 def resolve_clash_free_output(source_file: Path, new_stem: str, new_ext: str) -> Path:
@@ -618,7 +697,7 @@ def flatten_alpha_to_rgb(im: Image.Image, bg_color=(255, 255, 255)) -> Image.Ima
     return im.convert("RGB")
 
 
-def save_image_in_format(im: Image.Image, out: Path, pil_fmt: str, quality: int = 90):
+def save_image_in_format(im: Image.Image, out: Path, pil_fmt: str, quality: int = 90, square_icon: bool = True):
     fmt = pil_fmt.upper()
     q = max(1, min(100, int(quality)))
     if fmt in ("JPEG", "JPG"):
@@ -643,8 +722,11 @@ def save_image_in_format(im: Image.Image, out: Path, pil_fmt: str, quality: int 
         rgba = im.convert("RGBA")
         w, h = rgba.size
         side = max(w, h)
-        sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-        sq.paste(rgba, ((side - w) // 2, (side - h) // 2))
+        if square_icon:
+            sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+            sq.paste(rgba, ((side - w) // 2, (side - h) // 2))
+        else:
+            sq = rgba.resize((side, side), Image.Resampling.LANCZOS)
         sq.save(out, "ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     else:
         im.save(out, fmt)
@@ -733,47 +815,141 @@ def strip_pdf_active_content(writer: pypdf.PdfWriter):
     """
     Sanitizes PDF catalog & pages against embedded scripts, auto-actions, forms, and malicious annotations
     while preserving safe external http(s)/mailto links without /Next chains.
+    Aborts with ValueError if sanitization fails so half-sanitized files are never produced.
     """
-    root = writer._root_object
-    for dangerous_key in ("/OpenAction", "/AA", "/JavaScript", "/JS", "/AcroForm", "/Metadata", "/PieceInfo"):
-        if dangerous_key in root:
-            del root[dangerous_key]
-    if "/Names" in root:
-        try:
-            names_obj = root["/Names"].get_object()
-            for k in ("/JavaScript", "/JS", "/EmbeddedFiles"):
-                if k in names_obj:
-                    del names_obj[k]
-        except Exception:
-            del root["/Names"]
-
-    for page in writer.pages:
-        for k in ("/AA", "/Metadata", "/PieceInfo"):
-            if k in page:
-                del page[k]
-        if "/Annots" in page:
-            safe_annots = ArrayObject()
+    try:
+        root = writer._root_object
+        for dangerous_key in ("/OpenAction", "/AA", "/JavaScript", "/JS", "/AcroForm", "/Collection", "/XFA", "/Metadata", "/PieceInfo"):
+            if dangerous_key in root:
+                del root[dangerous_key]
+        if "/Names" in root:
             try:
+                names_obj = root["/Names"].get_object()
+                for k in ("/JavaScript", "/JS", "/EmbeddedFiles"):
+                    if k in names_obj:
+                        del names_obj[k]
+            except Exception:
+                del root["/Names"]
+
+        if "/Outlines" in root:
+            try:
+                outl = root["/Outlines"]
+                if hasattr(outl, "get_object"):
+                    outl = outl.get_object()
+                stack = []
+                if "/First" in outl:
+                    stack.append(outl["/First"])
+                visited = set()
+                loop_guard = 0
+                while stack and loop_guard < 5000:
+                    loop_guard += 1
+                    curr_ref = stack.pop()
+                    ref_id = getattr(curr_ref, "idnum", None) if hasattr(curr_ref, "idnum") else id(curr_ref)
+                    if ref_id in visited:
+                        continue
+                    visited.add(ref_id)
+                    item = curr_ref.get_object() if hasattr(curr_ref, "get_object") else curr_ref
+                    if isinstance(item, dict):
+                        for k in ("/A", "/AA", "/SE"):
+                            if k in item:
+                                del item[k]
+                        if "/First" in item:
+                            stack.append(item["/First"])
+                        if "/Next" in item:
+                            stack.append(item["/Next"])
+            except Exception:
+                if "/Outlines" in root:
+                    del root["/Outlines"]
+
+        for page in writer.pages:
+            for k in ("/AA", "/Metadata", "/PieceInfo"):
+                if k in page:
+                    del page[k]
+            if "/Annots" in page:
+                safe_annots = ArrayObject()
                 raw_annots = page["/Annots"]
                 if hasattr(raw_annots, "get_object"):
                     raw_annots = raw_annots.get_object()
                 for ref in raw_annots:
                     annot = ref.get_object() if hasattr(ref, "get_object") else ref
-                    if annot.get("/Subtype") != "/Link" or "/AA" in annot:
+                    if not isinstance(annot, dict):
+                        continue
+                    if "/AA" in annot:
+                        del annot["/AA"]
+                    subtype = str(annot.get("/Subtype", ""))
+                    if subtype != "/Link":
                         continue
                     act = annot.get("/A")
                     if act is not None:
                         act_obj = act.get_object() if hasattr(act, "get_object") else act
-                        if act_obj.get("/S") == "/URI" and "/Next" not in act_obj:
+                        if isinstance(act_obj, dict) and act_obj.get("/S") == "/URI" and "/Next" not in act_obj:
                             uri = str(act_obj.get("/URI", "")).strip().lower()
                             if uri.startswith(("http://", "https://", "mailto:")):
                                 safe_annots.append(ref)
-            except Exception:
-                pass
-            if safe_annots:
-                page[NameObject("/Annots")] = safe_annots
-            else:
-                del page["/Annots"]
+                if safe_annots:
+                    page[NameObject("/Annots")] = safe_annots
+                else:
+                    del page["/Annots"]
+    except Exception as e:
+        raise ValueError(f"PDF active content sanitization failed: {e}") from e
+
+
+_UNICODE_FONT_REGISTERED = None
+
+
+def _get_unicode_font_for_pdf() -> tuple[str, str, bool]:
+    """
+    Finds and registers a Unicode TTF from %WINDIR%\\Fonts.
+    Tries Nirmala UI, Segoe UI, Arial Unicode MS, Arial.
+    Returns (font_name_regular, font_name_bold, is_fallback).
+    """
+    global _UNICODE_FONT_REGISTERED
+    if _UNICODE_FONT_REGISTERED is not None:
+        return _UNICODE_FONT_REGISTERED
+
+    windir = Path(os.environ.get("WINDIR", os.environ.get("SYSTEMROOT", "C:\\Windows")))
+    fonts_dir = windir / "Fonts"
+
+    candidate_families = [
+        ("NirmalaUI", ["Nirmala.ttc", "Nirmala.ttf"], ["NirmalaB.ttc", "NirmalaB.ttf", "Nirmala.ttc"]),
+        ("SegoeUI", ["segoeui.ttf", "SegUIVar.ttf"], ["segoeuib.ttf"]),
+        ("ArialUnicode", ["ARIALUNI.TTF"], ["ARIALUNI.TTF"]),
+        ("Arial", ["arial.ttf"], ["arialbd.ttf"]),
+    ]
+
+    for fam_name, regs, bolds in candidate_families:
+        for reg_fn in regs:
+            reg_path = fonts_dir / reg_fn
+            if reg_path.is_file():
+                try:
+                    reg_font_name = f"{fam_name}_Reg"
+                    if reg_path.suffix.lower() == ".ttc":
+                        pdfmetrics.registerFont(TTFont(reg_font_name, str(reg_path), subfontIndex=0))
+                    else:
+                        pdfmetrics.registerFont(TTFont(reg_font_name, str(reg_path)))
+
+                    bold_font_name = reg_font_name
+                    for bold_fn in bolds:
+                        bold_path = fonts_dir / bold_fn
+                        if bold_path.is_file():
+                            try:
+                                b_name = f"{fam_name}_Bold"
+                                if bold_path.suffix.lower() == ".ttc":
+                                    pdfmetrics.registerFont(TTFont(b_name, str(bold_path), subfontIndex=0))
+                                else:
+                                    pdfmetrics.registerFont(TTFont(b_name, str(bold_path)))
+                                bold_font_name = b_name
+                                break
+                            except Exception:
+                                pass
+
+                    _UNICODE_FONT_REGISTERED = (reg_font_name, bold_font_name, False)
+                    return _UNICODE_FONT_REGISTERED
+                except Exception:
+                    continue
+
+    _UNICODE_FONT_REGISTERED = ("Helvetica", "Helvetica-Bold", True)
+    return _UNICODE_FONT_REGISTERED
 
 
 def recompress_pdf_images(writer: pypdf.PdfWriter, quality: int = 70, max_side: int = 1800):
@@ -839,7 +1015,11 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         }
         ext, pil_fmt = fmt_map[tool_id]
         out = resolve_clash_free_output(first, stem, ext)
-        save_image_in_format(im, out, pil_fmt, quality=int(opts.get("quality", 90)))
+        save_image_in_format(
+            im, out, pil_fmt,
+            quality=int(opts.get("quality", 90)),
+            square_icon=bool(opts.get("square_icon", True)),
+        )
         return out
 
     # --- Group 2: Edit Image (7) — Keep Original Image Format ---
@@ -871,8 +1051,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                     best_data = data
                 out.write_bytes(best_data or b"")
             elif qual < 95:
-                colors = 256 if qual >= 70 else (128 if qual >= 40 else 64)
-                q_im = im.convert("RGBA").quantize(colors=colors, method=Image.Quantize.FASTOCTREE)
+                num_colors = 256 if qual >= 70 else (128 if qual >= 40 else 64)
+                q_im = im.convert("RGBA").quantize(colors=num_colors, method=Image.Quantize.FASTOCTREE)
                 q_im.save(out, "PNG", optimize=True, compress_level=9)
             else:
                 save_image_in_format(im, out, pil_fmt, quality=qual)
@@ -957,23 +1137,32 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         im = load_safe_image(first)
         pil_fmt, ext_dot = FORMAT_OF_SUFFIX.get(first.suffix.lower(), ("PNG", ".png"))
         alpha = im.split()[-1] if im.mode in ("RGBA", "LA") else None
-        rgb = im.convert("RGB")
+        orig_rgb = im.convert("RGB")
+        rgb = orig_rgb.copy()
         effect = opts.get("effect", "grayscale")
+        strength = int(opts.get("strength", 100))
+        strength = max(0, min(100, strength))
+        t = strength / 100.0
+
         if effect == "grayscale":
-            rgb = ImageOps.grayscale(rgb).convert("RGB")
+            effect_rgb = ImageOps.grayscale(orig_rgb).convert("RGB")
+            rgb = Image.blend(orig_rgb, effect_rgb, t)
         elif effect == "sepia":
-            g = ImageOps.grayscale(rgb)
-            rgb = ImageOps.colorize(g, "#2b1d0e", "#f5e1c0")
+            g = ImageOps.grayscale(orig_rgb)
+            effect_rgb = ImageOps.colorize(g, "#2b1d0e", "#f5e1c0")
+            rgb = Image.blend(orig_rgb, effect_rgb, t)
         elif effect == "invert":
-            rgb = ImageOps.invert(rgb)
+            rgb = ImageOps.invert(orig_rgb)
         elif effect == "autocontrast":
-            rgb = ImageOps.autocontrast(rgb, cutoff=1)
+            rgb = ImageOps.autocontrast(orig_rgb, cutoff=1)
         elif effect == "sharpen":
-            rgb = ImageEnhance.Sharpness(rgb).enhance(2.0)
+            factor = 1.0 + 1.0 * t
+            rgb = ImageEnhance.Sharpness(orig_rgb).enhance(factor)
         elif effect == "blur":
-            rgb = rgb.filter(ImageFilter.GaussianBlur(radius=float(opts.get("blur_px", 3.0))))
+            blur_px = float(opts.get("blur_px", 3.0))
+            rgb = orig_rgb.filter(ImageFilter.GaussianBlur(radius=blur_px))
         elif effect == "bw":
-            g = ImageOps.grayscale(rgb)
+            g = ImageOps.grayscale(orig_rgb)
             rgb = g.point(lambda p: 255 if p >= 128 else 0).convert("RGB")
         if alpha is not None and pil_fmt in ("PNG", "WEBP", "TIFF"):
             rgb = rgb.convert("RGBA")
@@ -1068,15 +1257,19 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             else:
                 pages_rgb.append(rgb)
 
+        save_kwargs = {"resolution": 150.0}
+        if "quality" in opts and opts["quality"] is not None:
+            save_kwargs["quality"] = max(1, min(100, int(opts["quality"])))
+
         if combine or len(pages_rgb) == 1:
             out = resolve_clash_free_output(first, stem, "pdf")
-            pages_rgb[0].save(out, "PDF", resolution=150.0, save_all=True, append_images=pages_rgb[1:])
+            pages_rgb[0].save(out, "PDF", save_all=True, append_images=pages_rgb[1:], **save_kwargs)
             return out
         else:
             out_first = None
             for p_in, page_im in zip(inputs, pages_rgb):
                 out = resolve_clash_free_output(p_in, p_in.stem, "pdf")
-                page_im.save(out, "PDF", resolution=150.0)
+                page_im.save(out, "PDF", **save_kwargs)
                 if out_first is None:
                     out_first = out
             return out_first
@@ -1207,11 +1400,9 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             buf2 = io.BytesIO()
             w_lossless.write(buf2)
             compressed_bytes2 = buf2.getvalue()
-            if len(compressed_bytes2) < orig_file_size:
-                compressed_bytes = compressed_bytes2
-            else:
-                out.write_bytes(first.read_bytes())
-                return out
+            # If lossless compression did not reduce size, still write the sanitized lossless stream
+            # to guarantee that malicious active content is NEVER passed through via raw read_bytes()
+            compressed_bytes = compressed_bytes2
 
         out.write_bytes(compressed_bytes)
         return out
@@ -1295,75 +1486,204 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         return out
 
     if tool_id == "word_to_pdf":
+        # 1. Pre-check zip container limits before loading with docx
         with zipfile.ZipFile(first, "r") as zf:
-            names = [n.lower() for n in zf.namelist()]
-            if any("vbaproject.bin" in n for n in names):
-                raise ValueError("Refused Word document containing executable VBA macros")
+            infolist = zf.infolist()
+            if len(infolist) > 2000:
+                raise ValueError("Refused Word document: archive member count exceeds 2,000 files limit")
+            total_uncompressed = 0
+            for info in infolist:
+                if info.file_size > 100 * 1024 * 1024:
+                    raise ValueError(f"Refused Word document: entry '{info.filename}' exceeds 100 MiB uncompressed limit")
+                total_uncompressed += info.file_size
+                if "vbaproject.bin" in info.filename.lower():
+                    raise ValueError("Refused Word document containing executable VBA macros")
+            if total_uncompressed > 200 * 1024 * 1024:
+                raise ValueError("Refused Word document: total uncompressed content exceeds 200 MiB limit")
+
         doc_obj = docx.Document(str(first))
         out = resolve_clash_free_output(first, stem, "pdf")
-        c = rl_canvas.Canvas(str(out), pagesize=A4)
-        width_pt, height_pt = A4
-        y = height_pt - 54
-        for para in doc_obj.paragraphs:
-            txt = para.text.strip()
-            if not txt:
-                y -= 10
-                continue
-            style_name = (para.style.name if para.style else "").lower()
-            has_bold = any(bool(r.bold) for r in para.runs)
-            has_italic = any(bool(r.italic) for r in para.runs)
-            if "heading 1" in style_name:
-                c.setFont("Helvetica-Bold", 16)
-                step = 22
-            elif "heading" in style_name:
-                c.setFont("Helvetica-Bold", 13)
-                step = 18
-            elif has_bold and has_italic:
-                c.setFont("Helvetica-BoldOblique", 11)
-                step = 15
-            elif has_bold:
-                c.setFont("Helvetica-Bold", 11)
-                step = 15
-            elif has_italic:
-                c.setFont("Helvetica-Oblique", 11)
-                step = 15
-            else:
-                c.setFont("Helvetica", 11)
-                step = 15
-            if "list bullet" in style_name:
-                txt = f"•  {txt}"
-            if y < 60:
-                c.showPage()
-                y = height_pt - 54
-                c.setFont("Helvetica", 11)
-            c.drawString(54, y, txt[:105])
-            y -= step
-        for tbl in doc_obj.tables:
-            for row in tbl.rows:
-                row_txt = "  |  ".join(cell.text.strip() for cell in row.cells)
-                if y < 60:
-                    c.showPage()
-                    y = height_pt - 54
-                c.setFont("Helvetica", 10)
-                c.drawString(54, y, row_txt[:105])
-                y -= 14
-        for rel in doc_obj.part.rels.values():
-            if "image" in getattr(rel, "reltype", ""):
+
+        # 2. Register Unicode font with Devanagari / CJK support if available
+        reg_font, bold_font, is_fallback = _get_unicode_font_for_pdf()
+
+        doc_template = SimpleDocTemplate(
+            str(out),
+            pagesize=A4,
+            leftMargin=40,
+            rightMargin=40,
+            topMargin=40,
+            bottomMargin=40,
+        )
+
+        styles = getSampleStyleSheet()
+        base_style = ParagraphStyle(
+            "WordBody",
+            parent=styles["Normal"],
+            fontName=reg_font,
+            fontSize=10,
+            leading=14,
+            textColor=rl_colors.black,
+        )
+        h1_style = ParagraphStyle(
+            "WordH1",
+            parent=base_style,
+            fontName=bold_font,
+            fontSize=15,
+            leading=19,
+            spaceAfter=6,
+        )
+        h2_style = ParagraphStyle(
+            "WordH2",
+            parent=base_style,
+            fontName=bold_font,
+            fontSize=12,
+            leading=16,
+            spaceAfter=4,
+        )
+        bullet_style = ParagraphStyle(
+            "WordBullet",
+            parent=base_style,
+            leftIndent=14,
+            firstLineIndent=-10,
+            spaceAfter=2,
+        )
+        warning_style = ParagraphStyle(
+            "WordWarning",
+            parent=base_style,
+            fontName=reg_font,
+            fontSize=9,
+            leading=12,
+            textColor=rl_colors.HexColor("#B45309"),
+            spaceAfter=8,
+        )
+
+        story = []
+        if is_fallback:
+            story.append(Paragraph(
+                "<b>Notice:</b> System Unicode fonts (Nirmala UI, Segoe UI, Arial) were not accessible. "
+                "Fallen back to standard Helvetica. Extended Unicode / Indic characters may not render.",
+                warning_style
+            ))
+            story.append(Spacer(1, 4))
+
+        cumulative_image_pixels = 0
+        placed_image_parts = set()
+        r_embed_qn = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+
+        # 3. Iterate elements in exact document body order
+        for elem in doc_obj.element.body:
+            tag = elem.tag.split("}")[-1]
+
+            if tag == "p":
+                p = docx.text.paragraph.Paragraph(elem, doc_obj)
+
+                # Process inline images inside paragraph
+                for blip in elem.xpath(".//a:blip"):
+                    embed_id = blip.get(r_embed_qn)
+                    if embed_id and embed_id in doc_obj.part.related_parts:
+                        img_part = doc_obj.part.related_parts[embed_id]
+                        if embed_id not in placed_image_parts:
+                            placed_image_parts.add(embed_id)
+                            try:
+                                blob = img_part.blob
+                                with Image.open(io.BytesIO(blob)) as test_im:
+                                    iw, ih = test_im.size
+                                if iw > 0 and ih > 0 and (iw * ih) <= MAX_IMAGE_PIXELS:
+                                    if cumulative_image_pixels + (iw * ih) <= MAX_COMBINED_PIXELS:
+                                        cumulative_image_pixels += iw * ih
+                                        avail_w = doc_template.width
+                                        avail_h = doc_template.height * 0.60
+                                        scale = min(1.0, avail_w / max(1, iw), avail_h / max(1, ih))
+                                        dw, dh = iw * scale, ih * scale
+                                        story.append(RLImage(io.BytesIO(blob), width=dw, height=dh))
+                                        story.append(Spacer(1, 4))
+                            except Exception:
+                                pass
+
+                # Extract styled text runs
+                txt = p.text.strip()
+                if not txt:
+                    continue
+
+                runs_xml = []
+                for r in p.runs:
+                    txt_part = xml_escape(r.text)
+                    if not txt_part:
+                        continue
+                    if r.bold and r.italic:
+                        runs_xml.append(f"<b><i>{txt_part}</i></b>")
+                    elif r.bold:
+                        runs_xml.append(f"<b>{txt_part}</b>")
+                    elif r.italic:
+                        runs_xml.append(f"<i>{txt_part}</i>")
+                    else:
+                        runs_xml.append(txt_part)
+
+                full_xml = "".join(runs_xml) if runs_xml else xml_escape(txt)
+                style_name = (p.style.name if p.style else "").lower()
+
+                if "heading 1" in style_name:
+                    chosen_style = h1_style
+                elif "heading" in style_name:
+                    chosen_style = h2_style
+                elif "list bullet" in style_name:
+                    full_xml = f"&bull;  {full_xml}"
+                    chosen_style = bullet_style
+                else:
+                    chosen_style = base_style
+
+                story.append(Paragraph(full_xml, chosen_style))
+                story.append(Spacer(1, 4))
+
+            elif tag == "tbl":
+                tbl = docx.table.Table(elem, doc_obj)
+                tbl_data = []
+                for row in tbl.rows:
+                    row_cells = []
+                    for c in row.cells:
+                        c_text = xml_escape(c.text.strip())
+                        row_cells.append(Paragraph(c_text, base_style))
+                    tbl_data.append(row_cells)
+
+                if tbl_data:
+                    plat_tbl = Table(tbl_data)
+                    plat_tbl.setStyle(TableStyle([
+                        ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#94A3B8")),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("TOPPADDING", (0, 0), (-1, -1), 3),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ]))
+                    story.append(plat_tbl)
+                    story.append(Spacer(1, 6))
+
+        # Check for unplaced images in document relationships
+        for rel_id, rel in doc_obj.part.rels.items():
+            if "image" in getattr(rel, "reltype", "") and rel_id not in placed_image_parts:
+                placed_image_parts.add(rel_id)
                 try:
                     blob = rel.target_part.blob
-                    im = Image.open(io.BytesIO(blob))
-                    im.load()
-                    max_w = width_pt - 108
-                    scale = min(1.0, max_w / max(1, im.width), 240.0 / max(1, im.height))
-                    dw, dh = im.width * scale, im.height * scale
-                    if y - dh < 54:
-                        c.showPage()
-                        y = height_pt - 54
-                    c.drawImage(ImageReader(io.BytesIO(blob)), 54, y - dh, width=dw, height=dh)
-                    y -= dh + 14
+                    with Image.open(io.BytesIO(blob)) as test_im:
+                        iw, ih = test_im.size
+                    if iw > 0 and ih > 0 and (iw * ih) <= MAX_IMAGE_PIXELS:
+                        if cumulative_image_pixels + (iw * ih) <= MAX_COMBINED_PIXELS:
+                            cumulative_image_pixels += iw * ih
+                            avail_w = doc_template.width
+                            avail_h = doc_template.height * 0.60
+                            scale = min(1.0, avail_w / max(1, iw), avail_h / max(1, ih))
+                            dw, dh = iw * scale, ih * scale
+                            story.append(RLImage(io.BytesIO(blob), width=dw, height=dh))
+                            story.append(Spacer(1, 4))
                 except Exception:
-                    continue
-        c.save()
+                    pass
+
+        if not story or (is_fallback and len(story) == 1):
+            story.append(Paragraph("(Empty Document)", base_style))
+
+        doc_template.build(story)
+        return out
         return out
 
     # --- GROUP 4: VIDEO AND AUDIO (12, FFMPEG LOCK-DOWN) ---
@@ -1372,6 +1692,10 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         "media_to_wav", "media_to_flac", "video_compress", "audio_compress",
         "media_trim", "video_to_gif", "video_mute", "video_frame_png"
     ):
+        disallowed_exts = {".m3u8", ".ts", ".sdp", ".txt"}
+        if first.suffix.lower() in disallowed_exts:
+            raise ValueError(f"Refused media playlist or concat stream file '{first.name}': disallowed stream vector")
+
         is_audio_in = first.suffix.lower() in AUDIO_EXTS
         ext_map = {
             "media_to_mp4": "mp4",
@@ -1389,15 +1713,32 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         }
         out = resolve_clash_free_output(first, stem, ext_map[tool_id])
         ff_bin = _find_ffmpeg()
-        cmd = [
-            ff_bin,
-            "-nostdin",
-            "-y",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-protocol_whitelist", "file,pipe",
-            "-threads", "2",
-        ]
+
+        # Probe duration for dynamic timeout calculation and audio detection
+        dur_sec = 0.0
+        has_audio = True
+        audio_is_aac = False
+        audio_bitrate_kbps: int | None = None
+        try:
+            probe_cmd = _ffmpeg_base_cmd(ff_bin) + ["-i", str(first.resolve())]
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
+            if "Audio:" not in probe.stderr:
+                has_audio = False
+            else:
+                if "Audio: aac" in probe.stderr:
+                    audio_is_aac = True
+                ab_m = re.search(r"Audio:[^\n]*?(\d+)\s*kb/s", probe.stderr)
+                if ab_m:
+                    audio_bitrate_kbps = int(ab_m.group(1))
+            dur_m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", probe.stderr)
+            if dur_m:
+                dur_sec = float(dur_m.group(1)) * 3600.0 + float(dur_m.group(2)) * 60.0 + float(dur_m.group(3))
+        except Exception:
+            pass
+
+        timeout_sec = max(180, int(dur_sec * 4)) if dur_sec > 0 else 180
+
+        cmd = _ffmpeg_base_cmd(ff_bin) + ["-y", "-threads", "2"]
         start_sec = parse_time(opts.get("start", "")) if opts.get("start") else 0.0
         end_sec = parse_time(opts.get("end", "")) if opts.get("end") else 0.0
         if start_sec > 0:
@@ -1419,7 +1760,16 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             maxh = int(opts.get("maxh", 0))
             if maxh > 0:
                 cmd += ["-vf", f"scale=-2:'min({maxh},ih)'"]
-            cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+            cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", crf, "-pix_fmt", "yuv420p"]
+            if has_audio:
+                if audio_is_aac:
+                    cmd += ["-c:a", "copy"]
+                else:
+                    a_br = min(audio_bitrate_kbps, 128) if audio_bitrate_kbps is not None else 128
+                    cmd += ["-c:a", "aac", "-b:a", f"{a_br}k"]
+            else:
+                cmd += ["-an"]
+            cmd += ["-movflags", "+faststart"]
         elif tool_id == "media_trim":
             if is_audio_in:
                 cmd += ["-vn", "-c:a", "libmp3lame", "-b:a", "192k"]
@@ -1448,29 +1798,32 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             cmd += ["-frames:v", "1"]
 
         # If extracting audio from a video that has NO audio track (e.g. silent screen recording),
-        # synthesize clean silence for video duration so output is never empty or failed!
-        if tool_id in ("media_to_mp3", "media_to_m4a", "media_to_wav", "media_to_flac") and not is_audio_in:
-            probe = subprocess.run([ff_bin, "-hide_banner", "-i", str(first.resolve())], capture_output=True, text=True)
-            if "Audio:" not in probe.stderr:
-                dur_m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", probe.stderr)
-                dur_sec = 2.0
-                if dur_m:
-                    dur_sec = max(0.5, float(dur_m.group(1))*3600.0 + float(dur_m.group(2))*60.0 + float(dur_m.group(3)))
-                cmd = [
-                    ff_bin, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
-                    "-f", "lavfi", "-t", f"{dur_sec:.3f}", "-i", "anullsrc=r=44100:cl=stereo"
-                ]
-                if tool_id in ("media_to_mp3", "audio_compress"):
-                    cmd += ["-c:a", "libmp3lame", "-b:a", f"{int(opts.get('bitrate', 128))}k"]
-                elif tool_id == "media_to_m4a":
-                    cmd += ["-c:a", "aac", "-b:a", "192k"]
-                elif tool_id == "media_to_wav":
-                    cmd += ["-c:a", "pcm_s16le"]
-                elif tool_id == "media_to_flac":
-                    cmd += ["-c:a", "flac"]
+        # synthesize clean silence for video duration so output is never empty or failed
+        if tool_id in ("media_to_mp3", "media_to_m4a", "media_to_wav", "media_to_flac") and not is_audio_in and not has_audio:
+            syn_dur = max(0.5, dur_sec) if dur_sec > 0 else 2.0
+            cmd = _ffmpeg_base_cmd(ff_bin) + [
+                "-y", "-f", "lavfi", "-t", f"{syn_dur:.3f}", "-i", "anullsrc=r=44100:cl=stereo"
+            ]
+            if tool_id in ("media_to_mp3", "audio_compress"):
+                cmd += ["-c:a", "libmp3lame", "-b:a", f"{int(opts.get('bitrate', 128))}k"]
+            elif tool_id == "media_to_m4a":
+                cmd += ["-c:a", "aac", "-b:a", "192k"]
+            elif tool_id == "media_to_wav":
+                cmd += ["-c:a", "pcm_s16le"]
+            elif tool_id == "media_to_flac":
+                cmd += ["-c:a", "flac"]
 
         cmd += ["--", str(out.resolve())]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            if out.exists():
+                try:
+                    out.unlink()
+                except Exception:
+                    pass
+            raise RuntimeError(f"FFmpeg operation timed out after {timeout_sec}s for '{first.name}'")
+
         if res.returncode != 0:
             if out.exists() and out.stat().st_size == 0:
                 try:
@@ -1489,18 +1842,42 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         # Ensure video_compress never increases file size
         if tool_id == "video_compress" and out.exists():
             orig_sz = first.stat().st_size if first.exists() else 0
-            if orig_sz > 0 and out.stat().st_size > orig_sz:
+            maxh = int(opts.get("maxh", 0))
+            if orig_sz > 0 and out.stat().st_size >= orig_sz:
                 out.unlink(missing_ok=True)
-                cmd_fb = [
-                    ff_bin, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
-                    "-i", str(first.resolve()),
-                    "-c:v", "libx264", "-preset", "slow", "-crf", "36", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
-                    "--", str(out.resolve())
+                cmd_fb = _ffmpeg_base_cmd(ff_bin) + [
+                    "-y", "-i", str(first.resolve()),
                 ]
-                subprocess.run(cmd_fb, capture_output=True, text=True, timeout=60)
+                if maxh > 0:
+                    cmd_fb += ["-vf", f"scale=-2:'min({maxh},ih)'"]
+                cmd_fb += [
+                    "-c:v", "libx264", "-preset", "slow", "-crf", "36", "-pix_fmt", "yuv420p",
+                ]
+                if has_audio:
+                    if audio_is_aac:
+                        cmd_fb += ["-c:a", "copy"]
+                    else:
+                        fb_br = min(audio_bitrate_kbps, 96) if audio_bitrate_kbps is not None else 96
+                        cmd_fb += ["-c:a", "aac", "-b:a", f"{fb_br}k"]
+                else:
+                    cmd_fb += ["-an"]
+                cmd_fb += ["-movflags", "+faststart", "--", str(out.resolve())]
+                try:
+                    subprocess.run(cmd_fb, capture_output=True, text=True, timeout=timeout_sec)
+                except subprocess.TimeoutExpired:
+                    if out.exists():
+                        try:
+                            out.unlink()
+                        except Exception:
+                            pass
+                    raise RuntimeError(f"FFmpeg fallback compression timed out after {timeout_sec}s")
                 if not out.exists() or out.stat().st_size >= orig_sz:
-                    out.write_bytes(first.read_bytes())
+                    if maxh == 0:
+                        out.write_bytes(first.read_bytes())
+                        set_last_notice("no size reduction possible")
+                    else:
+                        if not out.exists():
+                            out.write_bytes(first.read_bytes())
         return out
 
     # --- GROUP 5: ARCHIVES (4) ---
@@ -1655,19 +2032,22 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
 
     # --- GROUP 6: DATA AND TEXT (9) ---
     if tool_id == "json_pretty":
-        obj = json.loads(first.read_text(encoding="utf-8-sig"))
+        txt, _ = read_text_smart(first)
+        obj = json.loads(txt)
         out = resolve_clash_free_output(first, stem, "json")
         out.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return out
 
     if tool_id == "json_minify":
-        obj = json.loads(first.read_text(encoding="utf-8-sig"))
+        txt, _ = read_text_smart(first)
+        obj = json.loads(txt)
         out = resolve_clash_free_output(first, stem, "json")
         out.write_text(json.dumps(obj, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
         return out
 
     if tool_id == "json_to_csv":
-        data = json.loads(first.read_text(encoding="utf-8-sig"))
+        txt, _ = read_text_smart(first)
+        data = json.loads(txt)
         if isinstance(data, dict):
             for v in data.values():
                 if isinstance(v, list) and v and isinstance(v[0], dict):
@@ -1697,7 +2077,7 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         return out
 
     if tool_id == "csv_to_json":
-        text = first.read_text(encoding="utf-8-sig", errors="replace")
+        text, _ = read_text_smart(first)
         sample = text[:4096]
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
@@ -1710,16 +2090,7 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         return out
 
     if tool_id == "text_utf8":
-        raw = first.read_bytes()
-        txt = None
-        for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
-            try:
-                txt = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        if txt is None:
-            txt = raw.decode("utf-8", errors="replace")
+        txt, _ = read_text_smart(first)
         txt = txt.replace("\r\n", "\n").replace("\r", "\n")
         out_ext = first.suffix.lstrip(".") or "txt"
         out = resolve_clash_free_output(first, stem, out_ext)
@@ -1727,7 +2098,7 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         return out
 
     if tool_id == "text_crlf":
-        txt = first.read_text(encoding="utf-8-sig", errors="replace")
+        txt, _ = read_text_smart(first)
         lines = txt.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         out_ext = first.suffix.lstrip(".") or "txt"
         out = resolve_clash_free_output(first, stem, out_ext)
@@ -1735,30 +2106,59 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         return out
 
     if tool_id == "srt_to_vtt":
-        srt = first.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
-        body = re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", srt)
+        srt, _ = read_text_smart(first)
+        srt = srt.replace("\r\n", "\n").replace("\r", "\n").strip()
+        body = re.sub(r"(\d+:\d{2}:\d{2}),(\d{3})", r"\1.\2", srt)
         out = resolve_clash_free_output(first, stem, "vtt")
-        out.write_text("WEBVTT\n\n" + body.lstrip(), encoding="utf-8")
+        out.write_text("WEBVTT\n\n" + body.lstrip() + "\n", encoding="utf-8")
         return out
 
     if tool_id == "vtt_to_srt":
-        vtt = first.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
-        body = re.sub(r"^WEBVTT[^\n]*\n+", "", vtt.lstrip())
-        body = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", body)
-        blocks = [b.strip() for b in re.split(r"\n\s*\n", body.strip()) if b.strip()]
-        numbered = []
-        idx = 1
-        for b in blocks:
-            lines = b.split("\n")
-            if "-->" in lines[0]:
-                numbered.append(f"{idx}\n" + "\n".join(lines))
-                idx += 1
-            elif len(lines) >= 2 and "-->" in lines[1]:
-                lines[0] = str(idx)
-                numbered.append("\n".join(lines))
-                idx += 1
+        vtt, _ = read_text_smart(first)
+        vtt = vtt.replace("\r\n", "\n").replace("\r", "\n").strip()
+        raw_blocks = [b.strip() for b in re.split(r"\n\s*\n", vtt) if b.strip()]
+
+        def _norm_timestamp_part(ts: str) -> str:
+            ts = ts.strip().replace(",", ".")
+            m_short = re.match(r"^(\d+):(\d{2})\.(\d{3})$", ts)
+            if m_short:
+                tot_mm, ss, mmm = int(m_short.group(1)), m_short.group(2), m_short.group(3)
+                hh = tot_mm // 60
+                mm = tot_mm % 60
+                return f"{hh:02d}:{mm:02d}:{ss},{mmm}"
+            m_long = re.match(r"^(\d+):(\d{2}):(\d{2})\.(\d{3})$", ts)
+            if m_long:
+                hh, mm, ss, mmm = int(m_long.group(1)), m_long.group(2), m_long.group(3), m_long.group(4)
+                return f"{hh:02d}:{mm}:{ss},{mmm}"
+            return ts.replace(".", ",")
+
+        cues: list[str] = []
+        cue_idx = 1
+        for b in raw_blocks:
+            lines = [l.rstrip() for l in b.split("\n")]
+            if not lines:
+                continue
+            first_line = lines[0].strip()
+            # Skip WEBVTT header and NOTE/STYLE/REGION metadata blocks
+            if first_line.startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+                continue
+            timing_idx = next((i for i, l in enumerate(lines) if "-->" in l), -1)
+            if timing_idx == -1:
+                continue
+            parts = lines[timing_idx].split("-->")
+            if len(parts) != 2:
+                continue
+            start_str = _norm_timestamp_part(parts[0])
+            end_tokens = parts[1].strip().split()
+            if not end_tokens:
+                continue
+            end_str = _norm_timestamp_part(end_tokens[0])
+            payload = "\n".join(lines[timing_idx + 1:])
+            cues.append(f"{cue_idx}\n{start_str} --> {end_str}\n{payload}".rstrip())
+            cue_idx += 1
+
         out = resolve_clash_free_output(first, stem, "srt")
-        out.write_text(("\n\n".join(numbered) if numbered else body) + "\n", encoding="utf-8")
+        out.write_text(("\n\n".join(cues) if cues else "") + ("\n" if cues else ""), encoding="utf-8")
         return out
 
     if tool_id == "checksums_all":
@@ -1832,6 +2232,7 @@ def worker_main(job_file: str, result_file: str) -> int:
     outputs: list[str] = []
     errors: list[str] = []
     fallback_any = False
+    set_last_notice("")
 
     is_single_call = (
         tool_id in MULTI_FILE_BATCH_TOOLS
@@ -1856,6 +2257,7 @@ def worker_main(job_file: str, result_file: str) -> int:
             "ok": len(errors) == 0, "finished": True, "fraction": 1.0,
             "done": 1, "total": 1, "current": files[0].name if files else "",
             "outputs": outputs, "errors": errors, "fallback_used": fallback_any,
+            "notice": get_last_notice(),
         })
         return 0 if not errors else 1
 
@@ -1877,5 +2279,6 @@ def worker_main(job_file: str, result_file: str) -> int:
         "ok": len(outputs) > 0, "finished": True, "fraction": 1.0,
         "done": total, "total": total, "current": files[-1].name if files else "",
         "outputs": outputs, "errors": errors, "fallback_used": fallback_any,
+        "notice": get_last_notice(),
     })
     return 0 if len(outputs) > 0 else 1

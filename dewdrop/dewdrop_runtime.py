@@ -42,6 +42,7 @@ from dewdrop_core import (
     execute_tool,
     filter_and_rank_tools,
     has_ffmpeg,
+    _ffmpeg_base_cmd,
     sanitize_stem,
     resolve_clash_free_output,
     was_output_fallback_used,
@@ -699,14 +700,21 @@ def get_tool_ui_config(tool_id: str, quality_val: int, chip_idx: int, text_val: 
             "opts": {"rotation": rot, "flip": "none"},
         }
     if tool_id == "img_effects":
-        effs = ["grayscale", "sepia", "sharpen", "blur"]
+        effs = ["grayscale", "sepia", "sharpen", "blur", "invert", "autocontrast", "bw"]
         labels = ["Grayscale", "Sepia", "Sharpen", "Blur"]
+        cur_eff = effs[min(c, len(labels) - 1)]
+        has_slider = cur_eff in ("grayscale", "sepia", "sharpen", "blur")
+        slider_str = f"{max(1, q // 10)}px" if cur_eff == "blur" else f"{q}%"
         return {
             "chips": labels,
-            "has_slider": True,
-            "slider_str": f"{max(1, q // 10)}px",
+            "has_slider": has_slider,
+            "slider_str": slider_str if has_slider else None,
             "text_val": None,
-            "opts": {"effect": effs[min(c, 3)], "blur_px": max(1.0, q / 12.0)},
+            "opts": {
+                "effect": cur_eff,
+                "strength": q,
+                "blur_px": max(1.0, q / 12.0),
+            },
         }
     if tool_id == "img_watermark":
         pos_codes = ["br", "bl", "tr", "c"]
@@ -869,17 +877,27 @@ def capture_full_desktop_rgb(screen_w: int, screen_h: int) -> np.ndarray | None:
 
 
         hdc_scr = user32.GetDC(None)
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_scr)
-        bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), screen_w, -screen_h, 1, 32, 0, screen_w * screen_h * 4, 0, 0, 0, 0)
-        bits = ctypes.c_void_p()
-        hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-        old = gdi32.SelectObject(hdc_mem, hbmp)
-        gdi32.BitBlt(hdc_mem, 0, 0, screen_w, screen_h, hdc_scr, 0, 0, 0x00CC0020)
-        raw = ctypes.string_at(bits, screen_w * screen_h * 4)
-        gdi32.SelectObject(hdc_mem, old)
-        gdi32.DeleteObject(hbmp)
-        gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(None, hdc_scr)
+        if not hdc_scr:
+            return None
+        hdc_mem = None
+        hbmp = None
+        old = None
+        try:
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_scr)
+            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), screen_w, -screen_h, 1, 32, 0, screen_w * screen_h * 4, 0, 0, 0, 0)
+            bits = ctypes.c_void_p()
+            hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+            old = gdi32.SelectObject(hdc_mem, hbmp)
+            gdi32.BitBlt(hdc_mem, 0, 0, screen_w, screen_h, hdc_scr, 0, 0, 0x00CC0020)
+            raw = ctypes.string_at(bits, screen_w * screen_h * 4)
+        finally:
+            if hdc_mem:
+                if old:
+                    gdi32.SelectObject(hdc_mem, old)
+                if hbmp:
+                    gdi32.DeleteObject(hbmp)
+                gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(None, hdc_scr)
 
 
         bgra = np.frombuffer(raw, dtype=np.uint8).reshape((screen_h, screen_w, 4))
@@ -1114,124 +1132,125 @@ def capture_live_screen_rect_rgb(x: int, y: int, w: int, h: int) -> np.ndarray |
         if not hdc_scr:
             return None
 
-
-        key = (int(w), int(h))
-        if key in _SCREEN_CAPTURE_DCS:
-            hdc_mem, bits, _ = _SCREEN_CAPTURE_DCS[key]
-        else:
-            class BITMAPINFOHEADER(ctypes.Structure):
-                _fields_ = [
-                    ("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
-                    ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
-                    ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
-                    ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD),
-                ]
-
-
-            hdc_mem = gdi32.CreateCompatibleDC(hdc_scr)
-            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), int(w), -int(h), 1, 32, 0, int(w * h * 4), 0, 0, 0, 0)
-            bits = ctypes.c_void_p()
-            hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-            gdi32.SelectObject(hdc_mem, hbmp)
-            _SCREEN_CAPTURE_DCS[key] = (hdc_mem, bits, hbmp)
-
-
-        if is_stealth:
-            # Stealth mode: DewDrop has affinity 0x11, so DWM hardware-excludes it. Direct BitBlt works with zero feedback.
-            try:
-                ok = gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_scr, int(x), int(y), 0x40CC0020)
-                raw = ctypes.string_at(bits, int(w * h * 4))
-            finally:
-                user32.ReleaseDC(None, hdc_scr)
-            if not ok:
-                return None
-            bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
-            return bgra[..., [2, 1, 0]].astype(np.float32)
-
-
-        # 2. Record Mode (affinity 0x0):
-        # We MUST NEVER toggle SetWindowDisplayAffinity during capture! Toggling affinity 60 times/sec causes OBS to blink/strobe!
-        # First, search for the active top-level window directly beneath DewDrop in the Z-order.
-        target_win = None
-        GW_HWNDNEXT = 2
-        for overlay_hw in list(_ACTIVE_OVERLAY_HWNDS):
-            if user32.IsWindow(overlay_hw) and user32.IsWindowVisible(overlay_hw):
-                curr = user32.GetWindow(overlay_hw, GW_HWNDNEXT)
-                while curr:
-                    if user32.IsWindowVisible(curr) and curr not in _ACTIVE_OVERLAY_HWNDS:
-                        cls_buf = ctypes.create_unicode_buffer(256)
-                        user32.GetClassNameW(curr, cls_buf, 256)
-                        cls_name = cls_buf.value
-                        if cls_name not in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
-                            rc = wt.RECT()
-                            if user32.GetWindowRect(curr, ctypes.byref(rc)):
-                                if not (rc.right <= x or rc.left >= x + w or rc.bottom <= y or rc.top >= y + h):
-                                    bw = rc.right - rc.left
-                                    bh = rc.bottom - rc.top
-                                    if bw > 0 and bh > 0:
-                                        target_win = (curr, rc.left, rc.top, bw, bh)
-                                        break
-                    curr = user32.GetWindow(curr, GW_HWNDNEXT)
-                if target_win:
-                    break
-
-
-        if target_win:
-            hw_below, bx, by, bw, bh = target_win
-            try:
-                win_key = (int(bw), int(bh))
-                if win_key in _WINDOW_CAPTURE_DCS:
-                    hdc_win, bits_win, _ = _WINDOW_CAPTURE_DCS[win_key]
-                else:
-                    if len(_WINDOW_CAPTURE_DCS) >= 4:
-                        for k in list(_WINDOW_CAPTURE_DCS.keys()):
-                            old_dc, _, old_bmp = _WINDOW_CAPTURE_DCS.pop(k)
-                            try:
-                                gdi32.DeleteObject(old_bmp)
-                                gdi32.DeleteDC(old_dc)
-                            except Exception:
-                                pass
-                    hdc_win = gdi32.CreateCompatibleDC(hdc_scr)
-                    class BITMAPINFOHEADER(ctypes.Structure):
-                        _fields_ = [
-                            ("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
-                            ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
-                            ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
-                            ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD),
-                        ]
-                    bmi_w = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), int(bw), -int(bh), 1, 32, 0, int(bw * bh * 4), 0, 0, 0, 0)
-                    bits_win = ctypes.c_void_p()
-                    hbmp_w = gdi32.CreateDIBSection(hdc_win, ctypes.byref(bmi_w), 0, ctypes.byref(bits_win), None, 0)
-                    gdi32.SelectObject(hdc_win, hbmp_w)
-                    _WINDOW_CAPTURE_DCS[win_key] = (hdc_win, bits_win, hbmp_w)
-
-
-                # PW_RENDERFULLCONTENT = 2: Captures DirectComposition, hardware-accelerated Chrome/YouTube, VLC
-                ok = user32.PrintWindow(hw_below, hdc_win, 2)
-                if ok:
-                    sub_x = int(x - bx)
-                    sub_y = int(y - by)
-                    gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_win, sub_x, sub_y, 0x00CC0020)
-                    raw = ctypes.string_at(bits, int(w * h * 4))
-                    bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
-                    rgb_win = bgra[..., [2, 1, 0]].astype(np.float32)
-                    if rgb_win.max() > 0:
-                        return rgb_win
-            except Exception:
-                pass
-
-
-        # 3. If no application window is beneath us (e.g. over desktop wallpaper) or PrintWindow returns black:
-        wp_rgb = get_desktop_wallpaper_rect(x, y, w, h)
-        if wp_rgb is not None:
-            user32.ReleaseDC(None, hdc_scr)
-            return wp_rgb
-        # Use BitBlt with plain SRCCOPY (0x00CC0020).
-        # Because DewDrop is a layered window (WS_EX_LAYERED), plain SRCCOPY without CAPTUREBLT
-        # automatically excludes layered windows by GDI definition, eliminating self-capture feedback!
         try:
+            key = (int(w), int(h))
+            if key in _SCREEN_CAPTURE_DCS:
+                hdc_mem, bits, _, _ = _SCREEN_CAPTURE_DCS[key]
+            else:
+                if len(_SCREEN_CAPTURE_DCS) >= 4:
+                    for k in list(_SCREEN_CAPTURE_DCS.keys()):
+                        old_dc, _, old_bmp, old_obj = _SCREEN_CAPTURE_DCS.pop(k)
+                        try:
+                            gdi32.SelectObject(old_dc, old_obj)
+                            gdi32.DeleteObject(old_bmp)
+                            gdi32.DeleteDC(old_dc)
+                        except Exception:
+                            pass
+
+                class BITMAPINFOHEADER(ctypes.Structure):
+                    _fields_ = [
+                        ("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                        ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                        ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
+                        ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD),
+                    ]
+
+                hdc_mem = gdi32.CreateCompatibleDC(hdc_scr)
+                bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), int(w), -int(h), 1, 32, 0, int(w * h * 4), 0, 0, 0, 0)
+                bits = ctypes.c_void_p()
+                hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+                old_obj = gdi32.SelectObject(hdc_mem, hbmp)
+                _SCREEN_CAPTURE_DCS[key] = (hdc_mem, bits, hbmp, old_obj)
+
+            if is_stealth:
+                # Stealth mode: DewDrop has affinity 0x11, so DWM hardware-excludes it. Direct BitBlt works with zero feedback.
+                ok = gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_scr, int(x), int(y), 0x40CC0020)
+                if not ok:
+                    return None
+                raw = ctypes.string_at(bits, int(w * h * 4))
+                bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
+                return bgra[..., [2, 1, 0]].astype(np.float32)
+
+            # 2. Record Mode (affinity 0x0):
+            target_win = None
+            GW_HWNDNEXT = 2
+            for overlay_hw in list(_ACTIVE_OVERLAY_HWNDS):
+                if user32.IsWindow(overlay_hw) and user32.IsWindowVisible(overlay_hw):
+                    curr = user32.GetWindow(overlay_hw, GW_HWNDNEXT)
+                    while curr:
+                        if user32.IsWindowVisible(curr) and curr not in _ACTIVE_OVERLAY_HWNDS:
+                            cls_buf = ctypes.create_unicode_buffer(256)
+                            user32.GetClassNameW(curr, cls_buf, 256)
+                            cls_name = cls_buf.value
+                            if cls_name not in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+                                rc = wt.RECT()
+                                if user32.GetWindowRect(curr, ctypes.byref(rc)):
+                                    if not (rc.right <= x or rc.left >= x + w or rc.bottom <= y or rc.top >= y + h):
+                                        bw = rc.right - rc.left
+                                        bh = rc.bottom - rc.top
+                                        if bw > 0 and bh > 0:
+                                            target_win = (curr, rc.left, rc.top, bw, bh)
+                                            break
+                        curr = user32.GetWindow(curr, GW_HWNDNEXT)
+                    if target_win:
+                        break
+
+            if target_win:
+                hw_below, bx, by, bw, bh = target_win
+                try:
+                    win_key = (int(bw), int(bh))
+                    if win_key in _WINDOW_CAPTURE_DCS:
+                        hdc_win, bits_win, _, _ = _WINDOW_CAPTURE_DCS[win_key]
+                    else:
+                        if len(_WINDOW_CAPTURE_DCS) >= 4:
+                            for k in list(_WINDOW_CAPTURE_DCS.keys()):
+                                old_dc, _, old_bmp, old_obj = _WINDOW_CAPTURE_DCS.pop(k)
+                                try:
+                                    gdi32.SelectObject(old_dc, old_obj)
+                                    gdi32.DeleteObject(old_bmp)
+                                    gdi32.DeleteDC(old_dc)
+                                except Exception:
+                                    pass
+                        hdc_win = gdi32.CreateCompatibleDC(hdc_scr)
+                        class BITMAPINFOHEADER(ctypes.Structure):
+                            _fields_ = [
+                                ("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                                ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                                ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
+                                ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD),
+                            ]
+                        bmi_w = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), int(bw), -int(bh), 1, 32, 0, int(bw * bh * 4), 0, 0, 0, 0)
+                        bits_win = ctypes.c_void_p()
+                        hbmp_w = gdi32.CreateDIBSection(hdc_win, ctypes.byref(bmi_w), 0, ctypes.byref(bits_win), None, 0)
+                        old_win_obj = gdi32.SelectObject(hdc_win, hbmp_w)
+                        _WINDOW_CAPTURE_DCS[win_key] = (hdc_win, bits_win, hbmp_w, old_win_obj)
+
+                    # PW_RENDERFULLCONTENT = 2: Captures DirectComposition, hardware-accelerated Chrome/YouTube, VLC
+                    ok = user32.PrintWindow(hw_below, hdc_win, 2)
+                    if ok:
+                        sub_x = int(x - bx)
+                        sub_y = int(y - by)
+                        gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_win, sub_x, sub_y, 0x00CC0020)
+                        raw = ctypes.string_at(bits, int(w * h * 4))
+                        bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
+                        rgb_win = bgra[..., [2, 1, 0]].astype(np.float32)
+                        if rgb_win.max() > 0:
+                            return rgb_win
+                except Exception:
+                    pass
+
+            # 3. If no application window is beneath us (e.g. over desktop wallpaper) or PrintWindow returns black:
+            wp_rgb = get_desktop_wallpaper_rect(x, y, w, h)
+            if wp_rgb is not None:
+                return wp_rgb
+
             ok = gdi32.BitBlt(hdc_mem, 0, 0, int(w), int(h), hdc_scr, int(x), int(y), 0x00CC0020)
-            raw = ctypes.string_at(bits, int(w * h * 4))
+            if ok:
+                raw = ctypes.string_at(bits, int(w * h * 4))
+                bgra = np.frombuffer(raw, dtype=np.uint8).reshape((int(h), int(w), 4))
+                rgb = bgra[..., [2, 1, 0]].astype(np.float32)
+                if rgb.max() > 0:
+                    return rgb
         finally:
             user32.ReleaseDC(None, hdc_scr)
 
@@ -1900,14 +1919,18 @@ def ensure_demo_video_file() -> Path:
     if not sample_file.exists():
         ff = _find_ffmpeg()
         if ff and Path(ff).exists():
-            subprocess.run([
-                ff, "-nostdin", "-y",
+            cmd = _ffmpeg_base_cmd(ff) + [
+                "-y",
                 "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15",
                 "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
                 "-t", "3",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
                 str(sample_file)
-            ], capture_output=True)
+            ]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=15)
+            except Exception:
+                pass
     return sample_file if sample_file.exists() else ensure_demo_sample_file()
 
 
@@ -2268,44 +2291,57 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
         state["pager"] = RotationPager(len(state["groups"]), deadzone_radius=28.0, allow_negative=False)
 
 
-    _LAYERED_DIB_CACHE: dict[tuple[int, int], tuple] = {}
+    import collections
+    _LAYERED_DIB_CACHE: collections.OrderedDict[tuple[int, int], tuple] = collections.OrderedDict()
 
 
     def push_rgba_to_layered_hwnd(target_hwnd, pil_rgba: Image.Image, x: int, y: int):
         w, h = pil_rgba.size
         user32.SetWindowPos(target_hwnd, None, int(x), int(y), int(w), int(h), SWP_NOZORDER | SWP_NOACTIVATE)
 
-
         r_ch, g_ch, b_ch, a_ch = pil_rgba.convert("RGBa").split()
         bgra = Image.merge("RGBA", (b_ch, g_ch, r_ch, a_ch)).tobytes()
 
-
         key = (w, h)
         hdc_screen = user32.GetDC(None)
-        cached = _LAYERED_DIB_CACHE.get(key)
-        if cached is None:
-            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, w * h * 4, 0, 0, 0, 0)
-            bits = ctypes.c_void_p()
-            hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-            old = gdi32.SelectObject(hdc_mem, hbmp)
-            cached = (hdc_mem, hbmp, bits, old)
-            _LAYERED_DIB_CACHE[key] = cached
+        if not hdc_screen:
+            return
 
+        try:
+            cached = _LAYERED_DIB_CACHE.get(key)
+            if cached is None:
+                if len(_LAYERED_DIB_CACHE) >= 8:
+                    _, (old_dc, old_bmp, _, old_obj) = _LAYERED_DIB_CACHE.popitem(last=False)
+                    try:
+                        gdi32.SelectObject(old_dc, old_obj)
+                        gdi32.DeleteObject(old_bmp)
+                        gdi32.DeleteDC(old_dc)
+                    except Exception:
+                        pass
 
-        hdc_mem, hbmp, bits, old = cached
-        ctypes.memmove(bits, bgra, len(bgra))
+                hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+                bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, w * h * 4, 0, 0, 0, 0)
+                bits = ctypes.c_void_p()
+                hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+                old = gdi32.SelectObject(hdc_mem, hbmp)
+                cached = (hdc_mem, hbmp, bits, old)
+                _LAYERED_DIB_CACHE[key] = cached
+            else:
+                _LAYERED_DIB_CACHE.move_to_end(key)
 
+            hdc_mem, hbmp, bits, old = cached
+            ctypes.memmove(bits, bgra, len(bgra))
 
-        pt_dst = POINT(int(x), int(y))
-        sz = SIZE(w, h)
-        pt_src = POINT(0, 0)
-        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
-        user32.UpdateLayeredWindow(
-            target_hwnd, hdc_screen, ctypes.byref(pt_dst), ctypes.byref(sz),
-            hdc_mem, ctypes.byref(pt_src), 0, ctypes.byref(blend), ULW_ALPHA
-        )
-        user32.ReleaseDC(None, hdc_screen)
+            pt_dst = POINT(int(x), int(y))
+            sz = SIZE(w, h)
+            pt_src = POINT(0, 0)
+            blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+            user32.UpdateLayeredWindow(
+                target_hwnd, hdc_screen, ctypes.byref(pt_dst), ctypes.byref(sz),
+                hdc_mem, ctypes.byref(pt_src), 0, ctypes.byref(blend), ULW_ALPHA
+            )
+        finally:
+            user32.ReleaseDC(None, hdc_screen)
 
 
     def push_rgba_to_hwnd(hwnd, pil_rgba: Image.Image, x: int, y: int):
@@ -3788,6 +3824,10 @@ def run_windows_interactive_gui(start_mode: str = "ring_groups", cli_files: list
                             if errs:
                                 state["status_line"] = f"Done — {len(outs)} converted ({len(errs)} failed)"
                                 state["detail_line"] = errs[0][:44]
+                            elif snap.get("notice"):
+                                notice_txt = str(snap.get("notice")).strip()
+                                state["status_line"] = f"Done — {notice_txt}"
+                                state["detail_line"] = f"{notice_txt} • Saved in Dew Drop folder"
                             elif fb:
                                 state["status_line"] = "Done — Saved in Documents\\Dew Drop"
                                 state["detail_line"] = "Source folder read-only • Saved to Documents\\Dew Drop"

@@ -89,7 +89,7 @@ The catalogue below reflects the exact 50 tools defined in `dewdrop/dewdrop_core
 
 - **Operating System**: Windows 10 or Windows 11 (64-bit)
 - **Python**: 3.11 or newer (when installing or running from source)
-- **FFmpeg**: Required only for Video & Audio utilities. Dew Drop checks the following locations in order (`dewdrop/dewdrop_core.py:54-85`):
+- **FFmpeg**: Required only for Video & Audio utilities. Dew Drop checks the following locations in order:
   1. `<install_dir>\ffmpeg.exe`
   2. `<install_dir>\assets\ffmpeg.exe`
   3. Python environment directory (`<python_dir>\ffmpeg.exe`)
@@ -146,14 +146,13 @@ To remove Dew Drop:
 
 ## Security & Verification
 
-Defensive validation rules in `dewdrop/dewdrop_core.py`:
-- **Zip-Slip Traversal Prevention** (`dewdrop_core.py:165-174`): Extraction paths are validated using `.resolve().is_relative_to(dest_dir.resolve())`; any entry resolving outside target directory raises `ValueError`.
-- **Decompression Bomb Limits** (`dewdrop_core.py:160, 167`): Archives enforce an uncompressed size cap (`MAX_DECOMPRESSED_ARCHIVE_BYTES = 512 * 1024 * 1024`) and cumulative expansion ratio checks.
-- **Image Bomb Limits** (`dewdrop_core.py:108, 112`): Image dimensions are checked before decompression; inputs exceeding 40 megapixels (`MAX_IMAGE_PIXELS = 40_000_000`) are rejected.
-- **PDF Sanitization** (`dewdrop_core.py:734-775`): Embedded scripts and automatic actions (`/JavaScript`, `/JS`, `/Launch`, `/OpenAction`, `/RichMedia`) are stripped, preserving only safe external links.
-- **Office Macro Rejection** (`dewdrop_core.py:785-795`): Word `.docx` documents containing `vbaProject.bin` or macro streams are rejected.
-- **FFmpeg Protocol Whitelist** (`dewdrop_core.py:65`): Passes `-protocol_whitelist "file,pipe" -nostdin` to FFmpeg to block remote network calls or unauthorized protocol redirection.
-- **Filename & Path Sanitization** (`dewdrop_core.py:126-155`): Neutralizes leading hyphens (`-`), Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`), NTFS ADS colons (`:`), and trailing whitespace/dots.
+Defensive validation rules implemented across core operations:
+- **Archive Extraction Safety**: Archive extraction rejects absolute paths, drive/ADS colons, `..` traversal sequences, symlink/device entries, and reserved Windows device names (`CON`, `NUL`, `AUX`, `COM1-9`, `LPT1-9`). Extraction is capped at 512 MiB total and 2,000 files.
+- **Image Bomb Limits**: Image dimensions are checked before decompression; inputs exceeding 40 megapixels (`MAX_IMAGE_PIXELS = 40_000_000`) are rejected.
+- **PDF Sanitization**: An allow-list approach is enforced: only verified `http://`, `https://`, and `mailto:` link annotations without `/Next` action chains are preserved. Embedded scripts (`/JavaScript`, `/JS`), automatic triggers (`/Launch`, `/OpenAction`, `/AA`), interactive form fields, outlines actions, document metadata, and embedded files are removed.
+- **Office Macro Rejection**: Word `.docx` documents containing `vbaProject.bin` or macro streams are rejected before processing.
+- **FFmpeg Protocol Whitelist**: Passes `-protocol_whitelist "file,pipe" -nostdin` to FFmpeg to block remote network calls or unauthorized protocol redirection.
+- **Filename & Path Sanitization**: Neutralizes leading hyphens (`-`), Windows reserved device names, NTFS ADS colons (`:`), and trailing whitespace/dots.
 
 To run the verification test suite:
 
@@ -163,10 +162,13 @@ python dewdrop/tests/self_test.py
 
 ## Known Limitations
 
+- **Simplified Word->PDF Rendering**: Word-to-PDF conversion uses ReportLab Platypus to render document text, tables, and images in sequence. Complex floating shapes, WordArt, and proprietary pagination features are not preserved.
+- **PDF Form Fields & Metadata**: Sanitizing PDF documents strips interactive form fields (`/AcroForm`, `/XFA`) and document metadata.
 - **Text-Only PDF Extraction**: PDF-to-Word conversion extracts native text streams and layouts. Scanned image-only PDFs require OCR preprocessing.
 - **Word Document Formats**: Word-to-PDF conversion processes modern `.docx` format (OpenXML). Older binary `.doc` format is not supported.
 - **Resource Limits**: Individual batch operations enforce safety ceilings: 40 MP per image, 200 pages per PDF document, and 512 MB maximum output size.
-- **FFmpeg Dependency**: Audio and video operations require `ffmpeg.exe` to be accessible on your system.
+- **FFmpeg Dependency**: Audio and video operations require `ffmpeg.exe` to be installed and accessible on your system (not bundled).
+- **Unsigned Installer**: Because installer binaries are self-compiled open-source releases without a paid code-signing certificate, Windows SmartScreen may show an "Unknown Publisher" prompt upon first launch.
 
 ## License
 
