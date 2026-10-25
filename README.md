@@ -1,122 +1,173 @@
-<p align="center">
-  <img src="dewdrop/assets/logo-1024.png" alt="Dewdrop Logo" width="120" height="120">
-</p>
+# Dew Drop
 
-<h1 align="center">Dewdrop</h1>
+An on-demand, offline desktop tool ring for Windows with optical liquid-glass aesthetics.
 
-<p align="center">
-  <b>A modern Windows UI enhancement and desktop shell extension featuring liquid optics, dynamic island pill interactions, and fluid taskbar integration.</b>
-</p>
+![Dew Drop Main Ring](docs/screenshots/01-ring.png)
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
-  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Windows">
-</p>
+## Overview
 
----
+Dew Drop provides 50 offline utilities through an interactive 6-segment radial interface. It runs strictly on demand: nothing installs as a background service or startup item. Pressing the activation hotkey opens the ring at your cursor; if left idle, it automatically exits after 120 seconds to free all system resources.
 
-## 🌟 Overview
+![Dew Drop PDF Ring](docs/screenshots/02-pdf-ring.png)
 
-**Dewdrop** is a high-performance Windows desktop enhancement tool built with a robust hybrid architecture combining **Rust** (for core window management, engine speed, and shell integration) and **Python** (for scriptable automation and helper modules). It introduces fluid motion physics, modern window previews, and an interactive "island pill" interface to elevate your desktop experience.
+## Key Characteristics
 
-## 📸 Screenshots & Visual Showcase
+- **Zero Background Footprint**: No startup entries in the registry, no resident services, and no background daemon. The app launches on hotkey press (`CTRL+ALT+Z` by default) and exits cleanly when idle for 120 seconds.
+- **Offline Operation**: The application makes zero network calls while running (no sockets, no telemetry, no remote requests). Note that `Install.bat` uses `pip` during initial setup to download required Python libraries from PyPI.
+- **Non-Destructive**: Original files are never modified or overwritten. Output files are placed in a dedicated `Dew Drop` subfolder alongside the originals (or in `~/Documents/Dew Drop` if the input directory is read-only).
+- **Defensive Sandboxing**: File operations enforce safety limits against path traversal (Zip-Slip), decompression bombs, macro execution, and malicious PDF actions.
 
-### Island Pill & Progress Tracking
-<p align="center">
-  <img src="dewdrop/docs/evidence/compare_island-pill-progress.png" alt="Island Pill Progress" width="800">
-</p>
+![Dew Drop Progress](docs/screenshots/03-progress.png)
 
-### Window Options & Interactive Elements
-<p align="center">
-  <img src="dewdrop/docs/evidence/compare_window-options-and-progress.png" alt="Window Options" width="800">
-</p>
+## 50 Offline Tools Across 6 Real Categories
 
-### Optical Liquid Glass Showcase
-<p align="center">
-  <img src="dewdrop/docs/evidence/optical-liquid-glass-showcase.png" alt="Liquid Glass Showcase" width="800">
-</p>
+The catalogue below reflects the exact 50 tools defined in `dewdrop/dewdrop_core.py`:
 
-### Visual Comparisons & Layout Rings
-<div align="center">
-  <img src="dewdrop/docs/evidence/compare_ring-A.png" alt="Ring A" width="32%" style="display:inline-block;">
-  <img src="dewdrop/docs/evidence/compare_ring-B.png" alt="Ring B" width="32%" style="display:inline-block;">
-  <img src="dewdrop/docs/evidence/compare_ring-C.png" alt="Ring C" width="32%" style="display:inline-block;">
-</div>
+### 1. Convert Image (5 tools)
+- **PNG** (`img_to_png`): Convert to PNG format with optional max width and rotation.
+- **JPEG** (`img_to_jpeg`): Convert to JPEG format with customizable quality (1–100).
+- **WEBP** (`img_to_webp`): Convert to WebP format with quality control (1–100).
+- **GIF** (`img_to_gif`): Convert to animated/static GIF with width and rotation options.
+- **ICO** (`img_to_ico`): Square-padded Windows icon generation (16px to 256px).
 
-*View more visual metrics and comparisons in the `dewdrop/docs/evidence/` directory.*
+### 2. Edit Image (7 tools)
+- **Compress** (`img_compress`): Quality adjustment or target size in KB.
+- **Resize** (`img_resize`): Proportional percentage scaling or bounding box fitting.
+- **Crop shape** (`img_crop`): Aspect ratio cropping (1:1, 16:9, 4:3, 9:16) or custom interactive box.
+- **Rotate/Flip** (`img_rotate_flip`): 90°/180°/270° rotation and horizontal/vertical mirroring.
+- **Effects** (`img_effects`): Visual filter presets (Grayscale, Sepia, Invert, Blur, Sharpen, Brightness/Contrast).
+- **Watermark** (`img_watermark`): Stamp customizable text overlay in any corner.
+- **Clean EXIF** (`img_strip_meta`): Instantly strip all EXIF metadata and GPS tags.
 
-## ✨ Key Features
+### 3. PDF & Docs (13 tools)
+- **Images->PDF** (`pdf_from_images`): Combine multiple images into a single PDF document.
+- **Merge PDF** (`pdf_merge`): Concatenate multiple PDF files in sequential order.
+- **Split PDF** (`pdf_split`): Explode a PDF document into individual single-page files.
+- **Extract pg** (`pdf_extract_pages`): Extract a specific page or comma/hyphen page range (e.g. `1-3,5`).
+- **Delete pg** (`pdf_delete_pages`): Remove specified pages from a PDF.
+- **Reverse** (`pdf_reverse`): Reverse page ordering from last to first.
+- **Rotate PDF** (`pdf_rotate`): Rotate pages by 90°, 180°, or 270°.
+- **Compress** (`pdf_compress`): Re-compress content streams and optimize image assets.
+- **PDF->Text** (`pdf_to_text`): Extract plain text stream from PDF pages.
+- **PDF->Pics** (`pdf_extract_images`): Extract embedded raster images as discrete image files.
+- **Clean PDF** (`pdf_strip_meta`): Remove metadata, embedded scripts, and interactive actions.
+- **PDF->Word** (`pdf_to_word`): Convert PDF layout and text into an editable Word document (`.docx`).
+- **Word->PDF** (`word_to_pdf`): Render modern Word document (`.docx`) into a PDF file.
 
-* **Liquid Optics Engine:** Advanced visual rendering (`liquid_optics.py`) with backdrop filters that mimic fluid glass physics and provide smooth transparency.
-* **Dynamic Island Pill UI:** Expandable UI elements for quick actions, background task status, and interactive notifications.
-* **Rust-Powered Core:** Highly optimized crates (`dewdrop-core`, `dewdrop-engine`, `dewdrop-shell`) ensure minimal CPU overhead and memory safety while running continuously.
-* **Seamless Windows Explorer Integration:** Context-aware features, native-feeling window snapping, and selection hooks via custom JavaScript and Shell integrations.
-* **Automated Installation:** Easy setup with provided batch scripts and automated installer generation using Python and Inno Setup (`.iss`).
+### 4. Video & Audio (12 tools, require FFmpeg)
+- **MP4** (`media_to_mp4`): Transcode video to H.264 video with AAC audio.
+- **WEBM** (`media_to_webm`): Transcode video to VP9 video with Opus audio.
+- **MP3** (`media_to_mp3`): Extract or convert audio track to MP3.
+- **M4A** (`media_to_m4a`): Extract or convert audio track to AAC (`.m4a`).
+- **WAV** (`media_to_wav`): Convert audio to uncompressed PCM WAV.
+- **FLAC** (`media_to_flac`): Convert audio to lossless FLAC format.
+- **Shrink Vid** (`video_compress`): Multi-tier CRF video compression with optional maximum height.
+- **Shrink Aud** (`audio_compress`): Compress audio bitrate (64 kbps to 320 kbps).
+- **Trim** (`media_trim`): Cut media clip by specifying start and end timestamps.
+- **Video->GIF** (`video_to_gif`): Convert short video clips into animated GIF files.
+- **Mute Video** (`video_mute`): Strip audio stream without re-encoding video frames.
+- **Frame->PNG** (`video_frame_png`): Capture an exact high-resolution frame at timestamp as PNG.
 
-## 🗂️ Project Structure
+### 5. Archives (4 tools)
+- **Make ZIP** (`archive_zip`): Package staged files into a compressed `.zip` archive.
+- **TAR.GZ** (`archive_targz`): Package staged files into a `.tar.gz` archive.
+- **GZIP** (`archive_gzip`): Compress a single file using `.gz` compression.
+- **Extract** (`archive_extract`): Safely extract `.zip`, `.tar.gz`, `.tgz`, or `.gz` archives into a subfolder.
 
-```text
-dewdrop/
-├── assets/                 # Brand logos, icons, and web assets
-├── bins/                   # Executable binaries (dewdrop & dewdrop-worker)
-├── crates/                 # Core Rust library crates
-│   ├── dewdrop-core/       # Base definitions and utilities
-│   ├── dewdrop-engine/     # Rendering and animation engine
-│   └── dewdrop-shell/      # Windows shell integration and hooks
-├── docs/                   # Architecture decisions, limits, and visual evidence
-├── installer/              # Inno Setup scripts & builder engines
-├── tests/                  # Integration and verification test suites
-└── tools/                  # Build scripts, harnesses, and benchmarking tools
-```
+### 6. Data & Text (9 tools)
+- **JSON Pretty** (`json_pretty`): Reformat and indent JSON with 2 spaces.
+- **JSON Min** (`json_minify`): Strip whitespace to produce compact, single-line JSON.
+- **JSON->CSV** (`json_to_csv`): Convert a JSON list of objects into tabular CSV format.
+- **CSV->JSON** (`csv_to_json`): Convert tabular CSV rows into a structured JSON array.
+- **To UTF-8** (`text_utf8`): Normalize text encoding to standard UTF-8 with LF line endings.
+- **CRLF Lines** (`text_crlf`): Convert newline characters to Windows CRLF (`\r\n`).
+- **SRT->VTT** (`srt_to_vtt`): Convert SubRip subtitle files (`.srt`) to WebVTT format (`.vtt`).
+- **VTT->SRT** (`vtt_to_srt`): Convert WebVTT subtitles (`.vtt`) back to SubRip (`.srt`).
+- **Checksums** (`checksums_all`): Compute and export MD5, SHA-1, SHA-256, and SHA-512 hashes.
 
-## 🚀 Getting Started
+## System Requirements
 
-### Option 1: Quick Install (Recommended)
-1. Download or clone the repository:
-   ```bash
-   git clone https://github.com/N2V5Y7T/test3.git
-   ```
-2. Navigate to the root directory and run `Install.bat` to automatically set up the application on your system.
-3. Use `Run-Now.bat` to launch Dewdrop.
-   *(To remove the application, simply run `Uninstall.bat`)*
+- **Operating System**: Windows 10 or Windows 11 (64-bit)
+- **Python**: 3.11 or newer (when installing or running from source)
+- **FFmpeg**: Required only for Video & Audio utilities. Dew Drop checks the following locations in order (`dewdrop/dewdrop_core.py:54-85`):
+  1. `<install_dir>\ffmpeg.exe`
+  2. `<install_dir>\assets\ffmpeg.exe`
+  3. Python environment directory (`<python_dir>\ffmpeg.exe`)
+  4. System `PATH` (`shutil.which("ffmpeg")`)
+  5. Package manager paths (`%ProgramFiles%\ffmpeg\bin`, Chocolatey, Scoop, WinGet)
 
-### Option 2: Build from Source (For Developers)
-**Prerequisites:**
-* **Rust Toolchain** (latest stable with Cargo)
-* **Python 3.x** (for helper runtimes and testing tools)
-* **Windows 10 / 11**
+## Installation
 
-1. Clone the repository and navigate to the project directory:
-   ```bash
-   git clone https://github.com/N2V5Y7T/test3.git
-   cd test3/dewdrop
-   ```
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Run the application using the provided script:
+### Option 1: Standalone Installer
+
+1. Download `Dewdrop-Setup.exe` from the latest release.
+2. Because the binary is self-built and unsigned, Windows SmartScreen may display a warning dialog. Click **More info**, then click **Run anyway**.
+3. Choose your desired install location (defaults to `%LOCALAPPDATA%\Programs\DewDrop`) and global activation hotkey (default: `CTRL+ALT+Z`).
+
+### Option 2: Install from Source
+
+1. Clone or download this repository.
+2. Ensure [Python 3.11+](https://www.python.org/downloads/) is installed and added to your `PATH`.
+3. Double-click `Install.bat` (or run it from a command prompt):
    ```cmd
-   Run-From-Source.bat
+   Install.bat
    ```
-   *Alternatively, run it manually via Cargo:*
-   ```bash
-   cargo run --bin dewdrop
-   ```
+4. `Install.bat` verifies Python 3.11+, installs dependencies from `dewdrop/requirements.txt` via `pip`, deploys files to `%LOCALAPPDATA%\Programs\DewDrop`, and creates Start Menu and Desktop shortcuts with the specified hotkey.
 
-## 🛠️ Building the Installer
+## Quick Launch Without Installing
 
-To compile the application binaries and build a distributable Windows installer package, run:
+To run directly from source without installing to your user profile:
+
 ```cmd
-cd dewdrop
-Build-Installer.bat
+Run-Now.bat
 ```
-*(This triggers `build_installer.py` which utilizes Inno Setup to generate the executable).*
 
-## 🧪 Testing
+Or execute directly with Python:
 
-Dewdrop includes a comprehensive test suite to verify UI components, installer behavior, and module integrity. Run the cleanroom verification with:
-```bash
-python tests/run_cleanroom_verification.py
+```cmd
+python dewdrop/dewdrop_runtime.py
 ```
+
+## Building the Installer
+
+To build the standalone single-file installer (`Dewdrop-Setup.exe`):
+
+```cmd
+python dewdrop/build_installer.py
+```
+
+This compiles `dewdrop.exe` with PyInstaller, compresses it into the installer payload, and generates the final setup executable.
+
+## Uninstallation
+
+To remove Dew Drop:
+- Run `Uninstall.bat` from the repository or from `%LOCALAPPDATA%\Programs\DewDrop`.
+- The uninstaller stops running Dew Drop processes, deletes Desktop and Start Menu shortcuts, deletes `%LOCALAPPDATA%\Programs\DewDrop`, and prompts whether to delete user preferences from `%APPDATA%\DewDrop`.
+
+## Security & Verification
+
+Defensive validation rules in `dewdrop/dewdrop_core.py`:
+- **Zip-Slip Traversal Prevention** (`dewdrop_core.py:165-174`): Extraction paths are validated using `.resolve().is_relative_to(dest_dir.resolve())`; any entry resolving outside target directory raises `ValueError`.
+- **Decompression Bomb Limits** (`dewdrop_core.py:160, 167`): Archives enforce an uncompressed size cap (`MAX_DECOMPRESSED_ARCHIVE_BYTES = 512 * 1024 * 1024`) and cumulative expansion ratio checks.
+- **Image Bomb Limits** (`dewdrop_core.py:108, 112`): Image dimensions are checked before decompression; inputs exceeding 40 megapixels (`MAX_IMAGE_PIXELS = 40_000_000`) are rejected.
+- **PDF Sanitization** (`dewdrop_core.py:734-775`): Embedded scripts and automatic actions (`/JavaScript`, `/JS`, `/Launch`, `/OpenAction`, `/RichMedia`) are stripped, preserving only safe external links.
+- **Office Macro Rejection** (`dewdrop_core.py:785-795`): Word `.docx` documents containing `vbaProject.bin` or macro streams are rejected.
+- **FFmpeg Protocol Whitelist** (`dewdrop_core.py:65`): Passes `-protocol_whitelist "file,pipe" -nostdin` to FFmpeg to block remote network calls or unauthorized protocol redirection.
+- **Filename & Path Sanitization** (`dewdrop_core.py:126-155`): Neutralizes leading hyphens (`-`), Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`), NTFS ADS colons (`:`), and trailing whitespace/dots.
+
+To run the verification test suite:
+
+```cmd
+python dewdrop/tests/self_test.py
+```
+
+## Known Limitations
+
+- **Text-Only PDF Extraction**: PDF-to-Word conversion extracts native text streams and layouts. Scanned image-only PDFs require OCR preprocessing.
+- **Word Document Formats**: Word-to-PDF conversion processes modern `.docx` format (OpenXML). Older binary `.doc` format is not supported.
+- **Resource Limits**: Individual batch operations enforce safety ceilings: 40 MP per image, 200 pages per PDF document, and 512 MB maximum output size.
+- **FFmpeg Dependency**: Audio and video operations require `ffmpeg.exe` to be accessible on your system.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

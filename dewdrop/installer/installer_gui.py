@@ -310,7 +310,7 @@ class DewdropInstallerApp:
         launch_after: bool,
     ):
         try:
-            self.append_log("=== Starting Dewdrop Clean-Room Installation ===")
+            self.append_log("=== Starting Dew Drop Installation ===")
             self.append_log(f"Destination Folder: {dest}")
             self.append_log(f"Configuring Activation Shortcut: {hotkey}")
 

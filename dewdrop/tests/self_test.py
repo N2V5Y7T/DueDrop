@@ -33,7 +33,7 @@ from reportlab.lib.utils import ImageReader
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-EVIDENCE_DIR = ROOT / "docs" / "evidence"
+EVIDENCE_DIR = Path(tempfile.gettempdir()) / "Dewdrop_SelfTest"
 EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Re-export engine and tool specifications from dewdrop_core
@@ -71,12 +71,12 @@ from dewdrop_core import (
 def run_all_tests():
     results = {
         "unit_tests": {},
-        "liquid_glass_optics_and_zero_orange_audit": {},
+        "liquid_glass_optics": {},
         "tools_50": {},
         "pdf_to_word_10_samples": {},
         "batch_100": {},
-        "security_m6": {},
-        "cleanroom_audit": {},
+        "security_guards": {},
+        "integrity_audit": {},
         "performance": {},
     }
 
@@ -137,7 +137,7 @@ def run_all_tests():
     assert pager_single.accumulated_rad > 2.5, "Single-page ring must also track 360° cursor rotation arc"
     results["unit_tests"]["rotation_paging_cw_ccw_hysteresis"] = "PASS (CW -> Page 1, CCW -> Page 0, single-page & multi-page 360° arc verified)"
 
-    # Compatibility filtering & usage ranking tests (PROMPT.md §4 & §6)
+    # Compatibility filtering & usage ranking tests 
     ranked_png = filter_and_rank_tools([Path("sample.png")], ffmpeg_available=True, usage_counts={"img_to_webp": 15, "Edit image": 20})
     convert_group = dict(ranked_png).get("Convert image", [])
     convert_ids = [t[0] for t in convert_group]
@@ -187,7 +187,7 @@ def run_all_tests():
         assert orange_pixels == 0, f"Found {orange_pixels} orange-tinted pixels in {surf_name}!"
         mean_rgb = (round(float(np.mean(r_ch)), 1), round(float(np.mean(g_ch)), 1), round(float(np.mean(b_ch)), 1))
         assert mean_rgb[2] >= mean_rgb[0], f"Expected cool crystal-clear glass (B >= R) in {surf_name}, got {mean_rgb}"
-        results["liquid_glass_optics_and_zero_orange_audit"][surf_name] = (
+        results["liquid_glass_optics"][surf_name] = (
             f"PASS (size={surf_im.size}, orange_pixels=0, mean_rgb={mean_rgb})"
         )
 
@@ -404,7 +404,7 @@ def run_all_tests():
             "status": "PASS",
         }
 
-        # --- E. M6 Malicious Sample Suite ---
+        # --- E. Malicious Input & Security Suite ---
         zslip = tdir / "malicious_zipslip.zip"
         with zipfile.ZipFile(zslip, "w") as zf:
             zf.writestr("../../outside_escape.txt", "malicious payload")
@@ -412,7 +412,7 @@ def run_all_tests():
             execute_tool("archive_extract", [zslip], {})
             raise AssertionError("Zip-slip was not refused!")
         except ValueError as e:
-            results["security_m6"]["1_zip_slip_traversal"] = f"PASS (Refused: {e})"
+            results["security_guards"]["1_zip_slip_traversal"] = f"PASS (Refused: {e})"
 
         zbomb = tdir / "malicious_bomb.zip"
         with zipfile.ZipFile(zbomb, "w") as zf:
@@ -422,7 +422,7 @@ def run_all_tests():
             execute_tool("archive_extract", [zbomb], {})
             raise AssertionError("Zip bomb was not refused!")
         except ValueError as e:
-            results["security_m6"]["2_zip_decompression_bomb"] = f"PASS (Refused: {e})"
+            results["security_guards"]["2_zip_decompression_bomb"] = f"PASS (Refused: {e})"
 
         giant_png = tdir / "giant_100mp.png"
         Image.MAX_IMAGE_PIXELS = None
@@ -432,7 +432,7 @@ def run_all_tests():
             execute_tool("img_to_jpeg", [giant_png], {})
             raise AssertionError("100 MP image bomb was not refused!")
         except Exception as e:
-            results["security_m6"]["3_giant_40mp_image_bomb"] = f"PASS (Refused: {e})"
+            results["security_guards"]["3_giant_40mp_image_bomb"] = f"PASS (Refused: {e})"
 
         js_pdf = tdir / "malicious_js.pdf"
         jw = pypdf.PdfWriter()
@@ -443,7 +443,7 @@ def run_all_tests():
         cleaned_pdf = execute_tool("pdf_strip_meta", [js_pdf], {})
         raw_clean = cleaned_pdf.read_bytes()
         assert b"app.alert" not in raw_clean and b"/JavaScript" not in raw_clean and b"/OpenAction" not in raw_clean
-        results["security_m6"]["4_pdf_javascript_autoaction_strip"] = "PASS (Verified /JavaScript and /OpenAction completely stripped)"
+        results["security_guards"]["4_pdf_javascript_autoaction_strip"] = "PASS (Verified /JavaScript and /OpenAction completely stripped)"
 
         bad_m3u8 = tdir / "crafted.m3u8"
         bad_m3u8.write_text("#EXTM3U\n#EXTINF:1.0,\nhttp://127.0.0.1:9999/secret.ts\n", encoding="utf-8")
@@ -451,7 +451,7 @@ def run_all_tests():
             execute_tool("media_to_mp4", [bad_m3u8], {})
             raise AssertionError("Crafted network playlist was not refused!")
         except Exception as e:
-            results["security_m6"]["5_ffmpeg_protocol_whitelist_lockdown"] = f"PASS (Blocked external protocol: {str(e)[:120]})"
+            results["security_guards"]["5_ffmpeg_protocol_whitelist_lockdown"] = f"PASS (Blocked external protocol: {str(e)[:120]})"
 
         assert sanitize_stem("-rf --no-preserve-root") == "rf --no-preserve-root"
         assert sanitize_stem("CON.txt").startswith("_CON")
@@ -466,7 +466,7 @@ def run_all_tests():
             pass
         safe_rel = sanitize_rel_path("sub/file.txt. ", tdir)
         assert not str(safe_rel).endswith(". ")
-        results["security_m6"]["6_odd_filenames_and_device_names"] = "PASS (Leading '-', CON/NUL/CONIN$/CONOUT$/CLOCK$, ADS and trailing dots neutralized)"
+        results["security_guards"]["6_odd_filenames_and_device_names"] = "PASS (Leading '-', CON/NUL/CONIN$/CONOUT$/CLOCK$, ADS and trailing dots neutralized)"
 
         macro_docx = tdir / "macro_trojan.docx"
         shutil.copyfile(docx_path, macro_docx)
@@ -476,9 +476,9 @@ def run_all_tests():
             execute_tool("word_to_pdf", [macro_docx], {})
             raise AssertionError("Macro docx was not refused!")
         except ValueError as e:
-            results["security_m6"]["7_macro_enabled_docx_refused"] = f"PASS (Refused: {e})"
+            results["security_guards"]["7_macro_enabled_docx_refused"] = f"PASS (Refused: {e})"
 
-    # --- F. Clean-Room & Zero-Legacy Identity Audit ---
+    # --- F. Integrity & Cleanliness Audit ---
     forbidden_patterns = [
         "Open" + "Tangerine",
         "Open " + "Tangerine",
@@ -498,17 +498,17 @@ def run_all_tests():
             for pat in forbidden_patterns:
                 if pat.lower() in txt.lower():
                     hits.append(f"{p.relative_to(ROOT)}: {pat}")
-    assert not hits, f"Clean-room audit failed with hits: {hits}"
-    results["cleanroom_audit"] = {
+    assert not hits, f"Integrity audit failed with hits: {hits}"
+    results["integrity_audit"] = {
         "files_scanned": scanned_files,
         "forbidden_matches": len(hits),
-        "license_files_present": (ROOT / "LICENSE").exists() or (ROOT / "NOTICE").exists(),
-        "status": "PASS (0 legacy strings, 0 automatic LICENSE/NOTICE files)",
+        "license_files_present": (ROOT.parent / "LICENSE").exists(),
+        "status": "PASS (0 forbidden strings)",
     }
 
     out_json = EVIDENCE_DIR / "test_suite_results.json"
     out_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print(f"All verification suites PASSED: 50/50 tools, 10/10 PDF->Word samples, 100-file batch, 7/7 M6 security guards, Crystal-Clear Liquid-Glass zero-orange audit, Clean-Room audit ({scanned_files} files).")
+    print(f"All verification suites PASSED: 50/50 tools, 10/10 PDF->Word samples, 100-file batch, 7/7 security guards, Liquid-Glass neutral optics audit, Integrity audit ({scanned_files} files).")
 
 
 if __name__ == "__main__":
