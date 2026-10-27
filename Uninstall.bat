@@ -3,8 +3,10 @@ setlocal EnableDelayedExpansion
 
 :: 1. Re-run from %TEMP% so script does not lock or delete itself mid-run
 if /i not "%~dp0"=="%TEMP%\" (
+    set "CALLER_DIR=%~dp0"
+    if "!CALLER_DIR:~-1!"=="\" set "CALLER_DIR=!CALLER_DIR:~0,-1!"
     copy /y "%~f0" "%TEMP%\dewdrop_uninstall_runner.bat" >nul 2>nul
-    "%TEMP%\dewdrop_uninstall_runner.bat" %*
+    "%TEMP%\dewdrop_uninstall_runner.bat" "!CALLER_DIR!" %*
     exit /b %ERRORLEVEL%
 )
 
@@ -22,15 +24,22 @@ taskkill /IM pythonw.exe /FI "WINDOWTITLE eq Dewdrop*" /F >nul 2>nul
 :: 3. Resolve Installation Location
 set "TARGET_DIR="
 
-:: 3a. Read from registry (DewDrop or Dewdrop)
-for /f "tokens=2* skip=2" %%A in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DewDrop" /v InstallLocation 2^>nul') do set "TARGET_DIR=%%B"
+:: 3a. Check command line arguments first
+if exist "%~1\.dewdrop-install" set "TARGET_DIR=%~1"
 if not defined TARGET_DIR (
-    for /f "tokens=2* skip=2" %%A in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Dewdrop" /v InstallLocation 2^>nul') do set "TARGET_DIR=%%B"
+    if exist "%~2\.dewdrop-install" set "TARGET_DIR=%~2"
 )
 
-:: 3b. Fallback to passed argument or default installation location
+:: 3b. Read from registry (DewDrop or Dewdrop), only if valid marker exists
 if not defined TARGET_DIR (
-    if exist "%~1\.dewdrop-install" set "TARGET_DIR=%~1"
+    for /f "tokens=2* skip=2" %%A in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\DewDrop" /v InstallLocation 2^>nul') do (
+        if exist "%%~B\.dewdrop-install" set "TARGET_DIR=%%~B"
+    )
+)
+if not defined TARGET_DIR (
+    for /f "tokens=2* skip=2" %%A in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Dewdrop" /v InstallLocation 2^>nul') do (
+        if exist "%%~B\.dewdrop-install" set "TARGET_DIR=%%~B"
+    )
 )
 if not defined TARGET_DIR (
     if exist "%LOCALAPPDATA%\Programs\DewDrop\.dewdrop-install" set "TARGET_DIR=%LOCALAPPDATA%\Programs\DewDrop"

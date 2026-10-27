@@ -15,7 +15,7 @@ Dew Drop provides 50 offline utilities through an interactive 6-segment radial i
 - **Zero Background Footprint**: No startup entries in the registry, no resident services, and no background daemon. The app launches on hotkey press (`CTRL+ALT+Z` by default) and exits cleanly when idle for 120 seconds.
 - **Offline Operation**: The application makes zero network calls while running (no sockets, no telemetry, no remote requests). Note that `Install.bat` uses `pip` during initial setup to download required Python libraries from PyPI.
 - **Non-Destructive**: Original files are never modified or overwritten. Output files are placed in a dedicated `Dew Drop` subfolder alongside the originals (or in `~/Documents/Dew Drop` if the input directory is read-only).
-- **Defensive Sandboxing**: File operations enforce safety limits against path traversal (Zip-Slip), decompression bombs, macro execution, and malicious PDF actions.
+- **Defensive Hardening & Resource Caps**: File operations enforce strict safety limits against path traversal (Zip-Slip), decompression bombs, macro execution, and malicious PDF active content. On Windows, worker processes run under a 3 GiB Job Object memory limit to mitigate runaway allocations and memory bombs (note: this is a resource cap, not a security sandbox; it does not restrict filesystem or syscall access).
 
 ![Dew Drop Progress](docs/screenshots/03-progress.png)
 
@@ -28,7 +28,7 @@ The catalogue below reflects the exact 50 tools defined in `dewdrop/dewdrop_core
 - **JPEG** (`img_to_jpeg`): Convert to JPEG format with customizable quality (1–100).
 - **WEBP** (`img_to_webp`): Convert to WebP format with quality control (1–100).
 - **GIF** (`img_to_gif`): Convert to animated/static GIF with width and rotation options.
-- **ICO** (`img_to_ico`): Square-padded Windows icon generation (16px to 256px).
+- **ICO** (`img_to_ico`): Square-padded Windows icon generation (16px to 256px; canvas is capped at 256×256 pixels to prevent memory exhaustion).
 
 ### 2. Edit Image (7 tools)
 - **Compress** (`img_compress`): Quality adjustment or target size in KB.
@@ -52,7 +52,7 @@ The catalogue below reflects the exact 50 tools defined in `dewdrop/dewdrop_core
 - **PDF->Pics** (`pdf_extract_images`): Extract embedded raster images as discrete image files.
 - **Clean PDF** (`pdf_strip_meta`): Remove metadata, embedded scripts, and interactive actions.
 - **PDF->Word** (`pdf_to_word`): Convert PDF layout and text into an editable Word document (`.docx`).
-- **Word->PDF** (`word_to_pdf`): Render modern Word document (`.docx`) into a PDF file.
+- **Word->PDF** (`word_to_pdf`): Render modern Word document (`.docx`) into a PDF file (supports up to 63 columns per table, consistent with the WordprocessingML specification).
 
 ### 4. Video & Audio (12 tools, require FFmpeg)
 - **MP4** (`media_to_mp4`): Transcode video to H.264 video with AAC audio.
@@ -166,6 +166,8 @@ python dewdrop/tests/self_test.py
 - **PDF Form Fields & Metadata**: Sanitizing PDF documents strips interactive form fields (`/AcroForm`, `/XFA`) and document metadata.
 - **Text-Only PDF Extraction**: PDF-to-Word conversion extracts native text streams and layouts. Scanned image-only PDFs require OCR preprocessing.
 - **Word Document Formats**: Word-to-PDF conversion processes modern `.docx` format (OpenXML). Older binary `.doc` format is not supported.
+- **Word Tables & Columns**: Word-to-PDF supports tables up to 63 columns (the OpenXML standard maximum) and documents up to 5,000 table rows or 200,000 total cells to prevent memory exhaustion.
+- **ICO Canvas Limit**: Windows ICO icons are capped at a maximum canvas size of 256×256 pixels.
 - **Resource Limits**: Individual batch operations enforce safety ceilings: 40 MP per image, 200 pages per PDF document, and 512 MB maximum output size.
 - **FFmpeg Dependency**: Audio and video operations require `ffmpeg.exe` to be installed and accessible on your system (not bundled).
 - **Unsigned Installer**: Because installer binaries are self-compiled open-source releases without a paid code-signing certificate, Windows SmartScreen may show an "Unknown Publisher" prompt upon first launch.

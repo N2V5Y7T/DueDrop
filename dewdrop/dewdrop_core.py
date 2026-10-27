@@ -16,11 +16,16 @@ import sys
 import tarfile
 import tempfile
 import time
+import unicodedata
 import uuid
 import zipfile
 from pathlib import Path
 
+import lxml.etree
 import numpy as np
+
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(100000)
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 import pypdf
 from pypdf.generic import ArrayObject, DecodedStreamObject, NameObject, NumberObject
@@ -143,6 +148,23 @@ def read_text_smart(path_or_bytes: Path | str | bytes) -> tuple[str, str]:
         return raw.decode("utf-32"), "utf-32"
     if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
         return raw.decode("utf-16"), "utf-16"
+
+    # 1.5. UTF-16 heuristic without BOM (>=30% NUL bytes concentrated on odd or even indices)
+    if len(raw) >= 4:
+        nul_count = raw.count(0)
+        if (nul_count / len(raw)) >= 0.30:
+            odd_nuls = raw[1::2].count(0)
+            even_nuls = raw[0::2].count(0)
+            if odd_nuls > even_nuls:
+                try:
+                    return raw.decode("utf-16-le"), "utf-16-le"
+                except UnicodeDecodeError:
+                    pass
+            elif even_nuls > odd_nuls:
+                try:
+                    return raw.decode("utf-16-be"), "utf-16-be"
+                except UnicodeDecodeError:
+                    pass
 
     # 2. Strict UTF-8
     try:
@@ -380,7 +402,19 @@ RESERVED_DEVICE_NAMES = {
 }
 
 
+def _strip_format_and_controls(s: str) -> str:
+    """
+    Strips Unicode format characters (category 'Cf', including bidi overrides like RLO U+202E,
+    LRO, isolates, zero-width chars, BOMs) and C0/C1 control characters (\x00-\x1f, \x7f-\x9f).
+    """
+    return "".join(
+        ch for ch in s
+        if unicodedata.category(ch) != "Cf" and not ("\x00" <= ch <= "\x1f" or "\x7f" <= ch <= "\x9f")
+    )
+
+
 def sanitize_stem(raw_stem: str) -> str:
+    raw_stem = _strip_format_and_controls(raw_stem)
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_stem).strip().rstrip(". ").lstrip("-")
     base = cleaned if cleaned else "output"
     prefix = base.split(".")[0].upper()
@@ -392,10 +426,10 @@ def sanitize_stem(raw_stem: str) -> str:
 def sanitize_rel_path(rel_name: str, target_root: Path) -> Path:
     """
     Sanitizes archive relative paths, preventing directory traversal, absolute paths,
-    alternate data streams (ADS), and illegal Windows reserved device names in both
-    stem and suffix.
+    alternate data streams (ADS), illegal format/bidi controls (Cf), C0/C1 controls,
+    and illegal Windows reserved device names in both stem and suffix.
     """
-    norm = rel_name.replace("\\", "/")
+    norm = _strip_format_and_controls(rel_name).replace("\\", "/")
     if norm.startswith("/") or ":" in norm:
         raise ValueError(f"Refused archive entry with absolute/drive path or ADS: {rel_name}")
     parts = [p for p in norm.split("/") if p and p != "."]
@@ -409,7 +443,8 @@ def sanitize_rel_path(rel_name: str, target_root: Path) -> Path:
             clean = "entry"
         part_path = Path(clean)
         stem = sanitize_stem(part_path.stem)
-        suffix = re.sub(r'[<>:"/\\|?*\x00-\x1f ]', "_", part_path.suffix).rstrip(". ")
+        suffix = _strip_format_and_controls(part_path.suffix)
+        suffix = re.sub(r'[<>:"/\\|?*\x00-\x1f ]', "_", suffix).rstrip(". ")
         safe_parts.append(f"{stem}{suffix}"[:180])
     return target_root.joinpath(*safe_parts)
 
@@ -720,13 +755,14 @@ def save_image_in_format(im: Image.Image, out: Path, pil_fmt: str, quality: int 
         im.save(out, "TIFF", compression="tiff_deflate")
     elif fmt == "ICO":
         rgba = im.convert("RGBA")
-        w, h = rgba.size
-        side = max(w, h)
         if square_icon:
+            rgba.thumbnail((256, 256), Image.Resampling.LANCZOS)
+            w, h = rgba.size
+            side = max(w, h)
             sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
             sq.paste(rgba, ((side - w) // 2, (side - h) // 2))
         else:
-            sq = rgba.resize((side, side), Image.Resampling.LANCZOS)
+            sq = rgba.resize((256, 256), Image.Resampling.LANCZOS)
         sq.save(out, "ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     else:
         im.save(out, fmt)
@@ -892,6 +928,29 @@ def strip_pdf_active_content(writer: pypdf.PdfWriter):
                     del page["/Annots"]
     except Exception as e:
         raise ValueError(f"PDF active content sanitization failed: {e}") from e
+
+
+def finalize_sanitized_pdf(writer: pypdf.PdfWriter) -> bytes:
+    """
+    Purges unreferenced orphaned objects (such as /Launch, /JavaScript, /GoToR)
+    by writing sanitized pages to memory, re-reading with PdfReader, and copying
+    only the clean pages into a fresh PdfWriter while preserving rotation.
+    Enforces MAX_PDF_PAGES limit and prevents half-sanitized output.
+    """
+    strip_pdf_active_content(writer)
+    buf = io.BytesIO()
+    writer.write(buf)
+    buf.seek(0)
+    reader = pypdf.PdfReader(buf)
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise ValueError(f"PDF exceeds page limit ({len(reader.pages)} > {MAX_PDF_PAGES})")
+    clean_writer = pypdf.PdfWriter()
+    for page in reader.pages:
+        clean_writer.add_page(page)
+    strip_pdf_active_content(clean_writer)
+    out_buf = io.BytesIO()
+    clean_writer.write(out_buf)
+    return out_buf.getvalue()
 
 
 _UNICODE_FONT_REGISTERED = None
@@ -1224,7 +1283,16 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
     if tool_id == "img_strip_meta":
         im = load_safe_image(first)
         pil_fmt, ext_dot = FORMAT_OF_SUFFIX.get(first.suffix.lower(), ("PNG", ".png"))
-        clean = Image.frombytes(im.mode, im.size, im.tobytes())
+        if im.mode == "P":
+            clean = Image.frombytes(im.mode, im.size, im.tobytes())
+            clean.putpalette(im.getpalette())
+            if "transparency" in im.info:
+                clean.info["transparency"] = im.info["transparency"]
+        else:
+            clean = Image.frombytes(im.mode, im.size, im.tobytes())
+        clean.info.pop("exif", None)
+        clean.info.pop("icc_profile", None)
+        clean.info.pop("photoshop", None)
         out = resolve_clash_free_output(first, stem, ext_dot.lstrip("."))
         save_image_in_format(clean, out, pil_fmt, quality=92)
         return out
@@ -1284,10 +1352,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                 raise ValueError("Combined PDF exceeds 200-page safety limit")
             for page in reader.pages:
                 writer.add_page(page)
-        strip_pdf_active_content(writer)
         out = resolve_clash_free_output(first, f"{stem}_merged", "pdf")
-        with open(out, "wb") as f:
-            writer.write(f)
+        out.write_bytes(finalize_sanitized_pdf(writer))
         return out
 
     if tool_id == "pdf_split":
@@ -1296,10 +1362,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         for idx, page in enumerate(reader.pages, start=1):
             w = pypdf.PdfWriter()
             w.add_page(page)
-            strip_pdf_active_content(w)
             out = resolve_clash_free_output(first, f"{stem}_page_{idx:03d}", "pdf")
-            with open(out, "wb") as f:
-                w.write(f)
+            out.write_bytes(finalize_sanitized_pdf(w))
             if out_first is None:
                 out_first = out
         return out_first
@@ -1319,10 +1383,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                     writer.add_page(reader.pages[idx - 1])
         if len(writer.pages) == 0:
             raise ValueError("Resulting PDF has 0 pages")
-        strip_pdf_active_content(writer)
         out = resolve_clash_free_output(first, stem, "pdf")
-        with open(out, "wb") as f:
-            writer.write(f)
+        out.write_bytes(finalize_sanitized_pdf(writer))
         return out
 
     if tool_id == "pdf_reverse":
@@ -1330,10 +1392,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         writer = pypdf.PdfWriter()
         for page in reversed(reader.pages):
             writer.add_page(page)
-        strip_pdf_active_content(writer)
         out = resolve_clash_free_output(first, stem, "pdf")
-        with open(out, "wb") as f:
-            writer.write(f)
+        out.write_bytes(finalize_sanitized_pdf(writer))
         return out
 
     if tool_id == "pdf_rotate":
@@ -1347,10 +1407,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             if idx in target_set:
                 page.rotate(angle)
             writer.add_page(page)
-        strip_pdf_active_content(writer)
         out = resolve_clash_free_output(first, stem, "pdf")
-        with open(out, "wb") as f:
-            writer.write(f)
+        out.write_bytes(finalize_sanitized_pdf(writer))
         return out
 
     if tool_id == "pdf_compress":
@@ -1379,13 +1437,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             pass
         if level >= 2:
             recompress_pdf_images(writer, quality=q, max_side=max_side)
-        strip_pdf_active_content(writer)
         writer.add_metadata({})
-        out = resolve_clash_free_output(first, stem, "pdf")
-
-        buf = io.BytesIO()
-        writer.write(buf)
-        compressed_bytes = buf.getvalue()
+        compressed_bytes = finalize_sanitized_pdf(writer)
 
         if orig_file_size > 0 and len(compressed_bytes) > orig_file_size:
             w_lossless = pypdf.PdfWriter()
@@ -1396,14 +1449,9 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                     page.compress_content_streams()
                 except Exception:
                     pass
-            strip_pdf_active_content(w_lossless)
-            buf2 = io.BytesIO()
-            w_lossless.write(buf2)
-            compressed_bytes2 = buf2.getvalue()
-            # If lossless compression did not reduce size, still write the sanitized lossless stream
-            # to guarantee that malicious active content is NEVER passed through via raw read_bytes()
-            compressed_bytes = compressed_bytes2
+            compressed_bytes = finalize_sanitized_pdf(w_lossless)
 
+        out = resolve_clash_free_output(first, stem, "pdf")
         out.write_bytes(compressed_bytes)
         return out
 
@@ -1435,11 +1483,8 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         writer = pypdf.PdfWriter()
         for page in reader.pages:
             writer.add_page(page)
-        strip_pdf_active_content(writer)
-        writer.add_metadata({})
         out = resolve_clash_free_output(first, stem, "pdf")
-        with open(out, "wb") as f:
-            writer.write(f)
+        out.write_bytes(finalize_sanitized_pdf(writer))
         return out
 
     if tool_id == "pdf_to_word":
@@ -1500,6 +1545,29 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                     raise ValueError("Refused Word document containing executable VBA macros")
             if total_uncompressed > 200 * 1024 * 1024:
                 raise ValueError("Refused Word document: total uncompressed content exceeds 200 MiB limit")
+
+            if "word/document.xml" in zf.namelist():
+                xml_parser = lxml.etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+                doc_xml = lxml.etree.fromstring(zf.read("word/document.xml"), parser=xml_parser)
+                for gs in doc_xml.xpath("//*[local-name()='gridSpan']"):
+                    val_str = next((v for k, v in gs.attrib.items() if k == "val" or k.endswith("}val")), "")
+                    try:
+                        val = int(val_str)
+                    except (ValueError, TypeError):
+                        val = 999999
+                    if val < 1 or val > 63:
+                        raise ValueError("Refused Word document: table column span exceeds 63")
+                for tg in doc_xml.xpath("//*[local-name()='tblGrid']"):
+                    cols = tg.xpath("./*[local-name()='gridCol']")
+                    if len(cols) > 63:
+                        raise ValueError("Refused Word document: table column count exceeds 63")
+                for tbl_elem in doc_xml.xpath("//*[local-name()='tbl']"):
+                    rows = tbl_elem.xpath("./*[local-name()='tr']")
+                    if len(rows) > 5000:
+                        raise ValueError("Refused Word document: table row count exceeds 5,000")
+                total_tcs = len(doc_xml.xpath("//*[local-name()='tc']"))
+                if total_tcs > 200000:
+                    raise ValueError("Refused Word document: total cell count exceeds 200,000")
 
         doc_obj = docx.Document(str(first))
         out = resolve_clash_free_output(first, stem, "pdf")
@@ -1602,13 +1670,16 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                                 pass
 
                 # Extract styled text runs
-                txt = p.text.strip()
-                if not txt:
-                    continue
-
+                run_elems = elem.xpath(".//w:r[not(ancestor::w:del)]")
                 runs_xml = []
-                for r in p.runs:
-                    txt_part = xml_escape(r.text)
+                plain_texts = []
+                for r_elem in run_elems:
+                    r = docx.text.run.Run(r_elem, p)
+                    r_text = r.text
+                    if not r_text:
+                        continue
+                    plain_texts.append(r_text)
+                    txt_part = xml_escape(r_text)
                     if not txt_part:
                         continue
                     if r.bold and r.italic:
@@ -1620,7 +1691,11 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                     else:
                         runs_xml.append(txt_part)
 
-                full_xml = "".join(runs_xml) if runs_xml else xml_escape(txt)
+                fallback_text = "".join(plain_texts).strip()
+                if not fallback_text and not runs_xml:
+                    continue
+
+                full_xml = "".join(runs_xml) if runs_xml else xml_escape(fallback_text)
                 style_name = (p.style.name if p.style else "").lower()
 
                 if "heading 1" in style_name:
@@ -1639,14 +1714,20 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             elif tag == "tbl":
                 tbl = docx.table.Table(elem, doc_obj)
                 tbl_data = []
-                for row in tbl.rows:
+                for tr in elem.xpath("./w:tr"):
                     row_cells = []
-                    for c in row.cells:
+                    for tc in tr.xpath("./w:tc")[:63]:
+                        c = docx.table._Cell(tc, tbl)
                         c_text = xml_escape(c.text.strip())
                         row_cells.append(Paragraph(c_text, base_style))
-                    tbl_data.append(row_cells)
+                    if row_cells:
+                        tbl_data.append(row_cells)
 
                 if tbl_data:
+                    max_cols = max(len(r) for r in tbl_data)
+                    for r in tbl_data:
+                        while len(r) < max_cols:
+                            r.append(Paragraph("", base_style))
                     plat_tbl = Table(tbl_data)
                     plat_tbl.setStyle(TableStyle([
                         ("GRID", (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#94A3B8")),
@@ -1683,7 +1764,6 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
             story.append(Paragraph("(Empty Document)", base_style))
 
         doc_template.build(story)
-        return out
         return out
 
     # --- GROUP 4: VIDEO AND AUDIO (12, FFMPEG LOCK-DOWN) ---
@@ -1960,52 +2040,46 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
     if tool_id == "archive_extract":
         out_folder = resolve_clash_free_output(first, stem, "")
         out_folder.mkdir(parents=True, exist_ok=True)
-        name_l = first.name.lower()
-        total_written = 0
-        file_count = 0
+        try:
+            name_l = first.name.lower()
+            total_written = 0
+            file_count = 0
+            used_dest_paths: set[str] = set()
 
-        def check_rel_path(rel_name: str) -> Path:
-            return sanitize_rel_path(rel_name, out_folder)
+            def resolve_archive_dest(rel_name: str) -> Path:
+                dest = sanitize_rel_path(rel_name, out_folder)
+                dest_key = str(dest.resolve()).lower()
+                if dest_key not in used_dest_paths:
+                    used_dest_paths.add(dest_key)
+                    return dest
+                counter = 1
+                parent = dest.parent
+                stem_part = dest.stem
+                suffix_part = dest.suffix
+                while True:
+                    cand = parent / f"{stem_part} ({counter}){suffix_part}"
+                    cand_key = str(cand.resolve()).lower()
+                    if cand_key not in used_dest_paths:
+                        used_dest_paths.add(cand_key)
+                        return cand
+                    counter += 1
 
-        if name_l.endswith(".zip"):
-            with zipfile.ZipFile(first, "r") as zf:
-                for info in zf.infolist():
-                    if info.flag_bits & 0x1:
-                        raise ValueError("Refused password-protected archive entry")
-                    mode_hi = (info.external_attr >> 16) & 0xFFFF
-                    if stat.S_ISLNK(mode_hi) or stat.S_ISCHR(mode_hi) or stat.S_ISBLK(mode_hi) or stat.S_ISFIFO(mode_hi) or stat.S_ISSOCK(mode_hi):
-                        raise ValueError(f"Refused symlink/device entry in zip: {info.filename}")
-                    if info.is_dir():
-                        continue
-                    file_count += 1
-                    if file_count > MAX_ARCHIVE_FILES:
-                        raise ValueError("Archive exceeds 2,000 file count limit")
-                    dest = check_rel_path(info.filename)
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(info, "r") as src, open(dest, "wb") as dst:
-                        while True:
-                            chunk = src.read(65536)
-                            if not chunk:
-                                break
-                            total_written += len(chunk)
-                            if total_written > MAX_OUTPUT_BYTES:
-                                raise ValueError("Archive extraction exceeded 512 MiB limit")
-                            dst.write(chunk)
-        elif name_l.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-            with tarfile.open(first, "r:*") as tf:
-                for member in tf.getmembers():
-                    if member.isdir():
-                        continue
-                    if not member.isfile():
-                        raise ValueError("Refused symlink/device entry inside tar archive")
-                    file_count += 1
-                    if file_count > MAX_ARCHIVE_FILES:
-                        raise ValueError("Archive exceeds 2,000 file count limit")
-                    dest = check_rel_path(member.name)
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    src = tf.extractfile(member)
-                    if src:
-                        with open(dest, "wb") as dst:
+            if name_l.endswith(".zip"):
+                with zipfile.ZipFile(first, "r") as zf:
+                    for info in zf.infolist():
+                        if info.flag_bits & 0x1:
+                            raise ValueError("Refused password-protected archive entry")
+                        mode_hi = (info.external_attr >> 16) & 0xFFFF
+                        if stat.S_ISLNK(mode_hi) or stat.S_ISCHR(mode_hi) or stat.S_ISBLK(mode_hi) or stat.S_ISFIFO(mode_hi) or stat.S_ISSOCK(mode_hi):
+                            raise ValueError(f"Refused symlink/device entry in zip: {info.filename}")
+                        if info.is_dir():
+                            continue
+                        file_count += 1
+                        if file_count > MAX_ARCHIVE_FILES:
+                            raise ValueError("Archive exceeds 2,000 file count limit")
+                        dest = resolve_archive_dest(info.filename)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(info, "r") as src, open(dest, "wb") as dst:
                             while True:
                                 chunk = src.read(65536)
                                 if not chunk:
@@ -2014,20 +2088,46 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                                 if total_written > MAX_OUTPUT_BYTES:
                                     raise ValueError("Archive extraction exceeded 512 MiB limit")
                                 dst.write(chunk)
-        elif name_l.endswith((".gz", ".bz2", ".xz")):
-            opener = gzip.open if name_l.endswith(".gz") else (bz2.open if name_l.endswith(".bz2") else lzma.open)
-            dest = out_folder / sanitize_stem(first.stem)
-            with opener(first, "rb") as src, open(dest, "wb") as dst:
-                while True:
-                    chunk = src.read(65536)
-                    if not chunk:
-                        break
-                    total_written += len(chunk)
-                    if total_written > MAX_OUTPUT_BYTES:
-                        raise ValueError("Decompression exceeded 512 MiB limit")
-                    dst.write(chunk)
-        else:
-            raise ValueError(f"Unsupported archive format: {first.name}")
+            elif name_l.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+                with tarfile.open(first, "r:*") as tf:
+                    for member in tf.getmembers():
+                        if member.isdir():
+                            continue
+                        if not member.isfile():
+                            raise ValueError("Refused symlink/device entry inside tar archive")
+                        file_count += 1
+                        if file_count > MAX_ARCHIVE_FILES:
+                            raise ValueError("Archive exceeds 2,000 file count limit")
+                        dest = resolve_archive_dest(member.name)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        src = tf.extractfile(member)
+                        if src:
+                            with open(dest, "wb") as dst:
+                                while True:
+                                    chunk = src.read(65536)
+                                    if not chunk:
+                                        break
+                                    total_written += len(chunk)
+                                    if total_written > MAX_OUTPUT_BYTES:
+                                        raise ValueError("Archive extraction exceeded 512 MiB limit")
+                                    dst.write(chunk)
+            elif name_l.endswith((".gz", ".bz2", ".xz")):
+                opener = gzip.open if name_l.endswith(".gz") else (bz2.open if name_l.endswith(".bz2") else lzma.open)
+                dest = resolve_archive_dest(sanitize_stem(first.stem))
+                with opener(first, "rb") as src, open(dest, "wb") as dst:
+                    while True:
+                        chunk = src.read(65536)
+                        if not chunk:
+                            break
+                        total_written += len(chunk)
+                        if total_written > MAX_OUTPUT_BYTES:
+                            raise ValueError("Decompression exceeded 512 MiB limit")
+                        dst.write(chunk)
+            else:
+                raise ValueError(f"Unsupported archive format: {first.name}")
+        except Exception:
+            shutil.rmtree(out_folder, ignore_errors=True)
+            raise
         return out_folder
 
     # --- GROUP 6: DATA AND TEXT (9) ---
@@ -2035,24 +2135,35 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
         txt, _ = read_text_smart(first)
         obj = json.loads(txt)
         out = resolve_clash_free_output(first, stem, "json")
-        out.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            dumped = json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+            out.write_text(dumped, encoding="utf-8")
+        except UnicodeEncodeError:
+            dumped = json.dumps(obj, indent=2, ensure_ascii=True) + "\n"
+            out.write_text(dumped, encoding="utf-8")
         return out
 
     if tool_id == "json_minify":
         txt, _ = read_text_smart(first)
         obj = json.loads(txt)
         out = resolve_clash_free_output(first, stem, "json")
-        out.write_text(json.dumps(obj, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+        try:
+            dumped = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+            out.write_text(dumped, encoding="utf-8")
+        except UnicodeEncodeError:
+            dumped = json.dumps(obj, separators=(",", ":"), ensure_ascii=True)
+            out.write_text(dumped, encoding="utf-8")
         return out
 
     if tool_id == "json_to_csv":
         txt, _ = read_text_smart(first)
         data = json.loads(txt)
         if isinstance(data, dict):
-            for v in data.values():
-                if isinstance(v, list) and v and isinstance(v[0], dict):
-                    data = v
-                    break
+            list_keys = [k for k, v in data.items() if isinstance(v, list) and v and isinstance(v[0], dict)]
+            if len(list_keys) > 1:
+                raise ValueError(f"JSON has multiple list-of-objects values: {', '.join(list_keys)}")
+            elif len(list_keys) == 1:
+                data = data[list_keys[0]]
             else:
                 data = [data]
         if not isinstance(data, list) or not data or not all(isinstance(r, dict) for r in data):
@@ -2065,25 +2176,54 @@ def execute_tool(tool_id: str, inputs: list[Path], options: dict | None = None) 
                 if ks not in seen_cols:
                     seen_cols.add(ks)
                     cols.append(ks)
+
+        csv_safe = bool(opts.get("csv_safe", True))
+        def _sanitize_csv_cell(val):
+            if not csv_safe:
+                return val
+            if isinstance(val, str) and val and val[0] in ("=", "+", "-", "@", "\t", "\r"):
+                return "'" + val
+            return val
+
+        header_map = {col: _sanitize_csv_cell(col) for col in cols}
+        out_cols = [header_map[col] for col in cols]
+
         out = resolve_clash_free_output(first, stem, "csv")
         with open(out, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=cols)
+            writer = csv.DictWriter(f, fieldnames=out_cols)
             writer.writeheader()
             for r in data:
                 writer.writerow({
-                    k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)
+                    header_map[str(k)]: _sanitize_csv_cell(json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)
                     for k, v in r.items()
                 })
         return out
 
     if tool_id == "csv_to_json":
+        csv.field_size_limit(MAX_TEXT_INPUT_BYTES)
         text, _ = read_text_smart(first)
         sample = text[:4096]
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
         except Exception:
             dialect = csv.excel
-        reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+        f_in = io.StringIO(text)
+        reader_raw = csv.reader(f_in, dialect=dialect)
+        try:
+            raw_header = next(reader_raw)
+        except StopIteration:
+            raw_header = []
+        deduped_headers = []
+        counts = {}
+        for h in raw_header:
+            h_name = h if h != "" else "col"
+            if h_name in counts:
+                counts[h_name] += 1
+                deduped_headers.append(f"{h_name}_{counts[h_name]}")
+            else:
+                counts[h_name] = 1
+                deduped_headers.append(h_name)
+        reader = csv.DictReader(f_in, fieldnames=deduped_headers, dialect=dialect, restkey="_extra", restval="")
         data = [dict(r) for r in reader]
         out = resolve_clash_free_output(first, stem, "json")
         out.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
